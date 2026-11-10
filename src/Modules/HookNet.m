@@ -154,8 +154,8 @@ static void ck_didReceiveChallenge(id self, SEL _cmd, NSURLSession *session,
         }
     }
     @catch (NSException *e) {
-        CKLog(@"[pin] didReceiveChallenge 异常已吞掉（%s: %s），回落默认处理",
-              e.name.UTF8String ?: "?", e.reason.UTF8String ?: "?");
+        CKLog(@"[pin] didReceiveChallenge 异常已吞掉（%@: %@），回落默认处理",
+              (e.name ?: @"?"), (e.reason ?: @"?"));
         if (orig) {
             @try { orig(self, _cmd, session, task, challenge, completion); }
             @catch (NSException *e2) { (void)e2; }

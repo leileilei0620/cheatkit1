@@ -291,7 +291,8 @@ static void ck_ap_tick_impl(void) {
     CKParamSet(CKP_AP_AGGR, next);          // 滑块会同步跳过去
     ck_ap_applyCurve(next, YES);
 
-    CKLog(@"[AI] 第 %d 次调整 → 激进 %.2f（%s）", n, next, why.UTF8String ?: "?");
+    // ★ why 是中文理由，必须用 %@ 传 NSString；用 %s 传 UTF8String 会乱码。
+    CKLog(@"[AI] 第 %d 次调整 → 激进 %.2f（%@）", n, next, why ?: @"?");
 }
 
 static void ck_ap_tick(void *ctx) {

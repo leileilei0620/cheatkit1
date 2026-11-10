@@ -1029,8 +1029,12 @@ static void ck_hookClass(Class cls, const char *clsName, CKStat *st) {
         if (playDone)  st->play++;
         if (reward)    st->reward++;
         if (playStart) st->play++;   // 展示类计入播放统计，浮窗上看得出装了多少
-        CKLog(@"[引擎] hook %s -%s (%d 参, %s)", clsName, sn, sh.argc,
-              playDone ? "播完→补发" : (reward ? "奖励→只登记" : "展示→不补发"));
+        // ★ 最后那个占位符必须是 %@ 而不是 %s。
+        //   NSString 的 %s 按「系统默认编码」解 C 字符串，不等于 UTF-8；
+        //   传中文字面量会变成 A±iAs],\Ui%{€°•A€e 这种乱码。
+        NSString *kindDesc = playDone ? @"播完→补发"
+                           : (reward ? @"奖励→只登记" : @"展示→不补发");
+        CKLog(@"[引擎] hook %s -%s (%d 参, %@)", clsName, sn, sh.argc, kindDesc);
     }
     free(list);
 }
@@ -1083,7 +1087,9 @@ void CKDumpAdSDKs(void) {
         const char *cn = class_getName(classes[i]);
         if (!ck_isAdClass(cn)) continue;
         const char *sdk = ck_sdkOfName(cn);
-        CKLog(@"[dump] [%s] %s", sdk ? sdk : "?", cn);
+        // ★ sdk 来自 kSdkTable 的 name，含中文（"穿山甲/Pangle" 等），
+        //   必须转 NSString 用 %@ 输出；%s 会按系统编码解，直接乱码。
+        CKLog(@"[dump] [%@] %s", sdk ? [NSString stringWithUTF8String:sdk] : @"?", cn);
         unsigned int mn = 0;
         Method *ms = class_copyMethodList(classes[i], &mn);
         for (unsigned int j = 0; ms && j < mn; j++) {
