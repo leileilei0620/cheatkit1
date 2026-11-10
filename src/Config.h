@@ -61,6 +61,31 @@
 //   0 = 只用 _dyld_image_count / _dyld_get_image_name 函数层隐藏（安全）。
 #define ENABLE_DYLD_INFOARRAY_PATCH    0
 
+// ENABLE_CFUNC_HOOK  —— C 函数 inline hook 总闸（★ 默认 0）
+//
+//   这一组 hook 包括 stat / lstat / access / fopen / open / realpath /
+//   dlsym / fork / sandbox_check / ptrace / sysctl / getppid / getenv /
+//   _dyld_image_count / _dyld_get_image_name。
+//
+//   为什么默认关：
+//     inline hook 是「把目标函数开头几条指令改写成跳转」。改的那一瞬间，
+//     如果别的线程正好执行到该函数前几条指令 → 跳到半条指令上 → SIGBUS。
+//     libsystem 的 stat/fopen/dlsym 是全进程最高频的函数（每个线程都在调），
+//     裸注入（TrollFools，没有 Substrate/ElleKit 的 trampoline 保护）下
+//     这个窗口几乎必然被撞上。
+//
+//     实测崩溃栈（真机 idiom iOS 16.3.1）：
+//        0 dyld  strlen
+//        1 dyld  strcpy
+//        2 dyld  dyld4::APIs::dlsym(void*, char const*)
+//        3 CheatKit  CKInstallJailbreakBypass
+//     地址落在另一个系统库的 __TEXT（r-x，只读）→ KERN_PROTECTION_FAILURE。
+//     也就是说 dlsym 被打补丁后，dyld 内部解析路径时写到了只读页。
+//
+//   1 = 允许安装（只有确认手机有 ElleKit/Substrate 时才开）
+//   0 = 全部跳过，一次 dlsym 都不调用（当前默认，最稳）
+#define ENABLE_CFUNC_HOOK              0
+
 // ============================================================
 // 3. SDK 覆盖（通用引擎会自己探测，这里是精细 hook 的开关）
 // ============================================================

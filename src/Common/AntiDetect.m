@@ -108,6 +108,14 @@ static void *g_real_dlsym(void *handle, const char *symbol) {
 //    而不是在二进制里留符号引用（那样 dylib 一加载就被 dyld abort）
 // ============================================================
 static void ck_hook_symbol(const char *name, void *replacement, void **origOut) {
+#if !ENABLE_CFUNC_HOOK
+    // ★ C 函数 inline hook 总闸关着：连 dlsym 都不做。
+    //   见 Config.h 中 ENABLE_CFUNC_HOOK 的说明：libsystem 高频函数上打补丁，
+    //   裸注入环境下必然撞上半条指令 → SIGBUS。
+    (void)name; (void)replacement;
+    if (origOut) *origOut = NULL;
+    return;
+#else
     void *target = g_real_dlsym(RTLD_DEFAULT, name);
     if (!target) {
         CKLog(@"[hook] 跳过（符号缺失）: %s", name);
@@ -119,6 +127,7 @@ static void ck_hook_symbol(const char *name, void *replacement, void **origOut) 
         return;
     }
     CKLog(@"[hook] 已挂载: %s", name);
+#endif
 }
 
 // ============================================================
@@ -452,6 +461,10 @@ static ck_dyld_info_t *ck_get_all_image_infos(void) {
 // ============================================================
 void CKInstallJailbreakBypass(void) {
 #if ENABLE_ANTI_JAILBREAK
+#if !ENABLE_CFUNC_HOOK
+    CKLog(@"[jb] 文件层/符号层 C 函数 hook 已全局关闭（ENABLE_CFUNC_HOOK=0），"
+          @"只保留 ObjC 层 canOpenURL 屏蔽");
+#endif
     // 文件层
     ck_hook_symbol("stat",     (void *)ck_stat,     (void **)&orig_stat);
     ck_hook_symbol("lstat",    (void *)ck_lstat,    (void **)&orig_lstat);
@@ -482,6 +495,9 @@ void CKInstallJailbreakBypass(void) {
 
 void CKInstallAntiDebugBypass(void) {
 #if ENABLE_ANTI_DEBUG
+#if !ENABLE_CFUNC_HOOK
+    CKLog(@"[dbg] ptrace/sysctl/getppid/getenv hook 已全局关闭（ENABLE_CFUNC_HOOK=0）");
+#endif
     ck_hook_symbol("ptrace", (void *)ck_ptrace, (void **)&orig_ptrace);
     ck_hook_symbol("sysctl", (void *)ck_sysctl, (void **)&orig_sysctl);
     ck_hook_symbol("getppid", (void *)ck_getppid, (void **)&orig_getppid);
@@ -492,12 +508,19 @@ void CKInstallAntiDebugBypass(void) {
 
 void CKInstallDyldHide(void) {
 #if ENABLE_DYLD_HIDE
+#if !ENABLE_CFUNC_HOOK
+    CKLog(@"[dyld] 镜像隐藏已全局关闭（ENABLE_CFUNC_HOOK=0）：不改 _dyld_image_count，"
+          @"注入痕迹会出现在镜像列表里");
+#endif
     ck_hook_symbol("_dyld_image_count", (void *)ck_dyld_image_count,
                    (void **)&orig_image_count);
     ck_hook_symbol("_dyld_get_image_name", (void *)ck_dyld_get_image_name,
                    (void **)&orig_image_name);
+#if ENABLE_CFUNC_HOOK
     // 结构体层：先探一次，让 orig_all_image_infos 就位
+    //   ★ 这一句里要 dlsym("dyld_all_image_infos")，总闸关着时不碰
     ck_get_all_image_infos();
+#endif
     CKLog(@"dyld 镜像隐藏已安装");
 #endif
 }

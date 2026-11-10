@@ -16,7 +16,9 @@
 #import <stdint.h>   // int64_t（dispatch_time 参数）
 #import <unistd.h>   // getpid
 #import <UIKit/UIKit.h>
-#import <dlfcn.h>              // dlsym（单实例检测）
+#import <dlfcn.h>              // dladdr（单实例检测，定位自己的镜像）
+#import <mach-o/dyld.h>        // _dyld_image_count / _dyld_get_image_header（不走 hook）
+#import <string.h>             // strrchr / strncmp
 #import <dispatch/dispatch.h>   // dispatch_after / dispatch_get_main_queue 显式声明，
                                 // 不依赖 Foundation 的间接包含链（Linux 交叉编译更稳）
 
@@ -160,12 +162,58 @@ static void ck_schedule_bootstrap(void) {
 // ============================================================
 int g_cheatkit_instance_guard = 1;
 
+// 取自己在 dyld 镜像表里的序号。
+//   ★ 不用 dlsym：TrollFools 注入的 dylib 默认不是 RTLD_GLOBAL，
+//     dlsym(RTLD_DEFAULT, ...) 根本查不到别的副本里的符号，
+//     所以上一版用符号地址比对的方案在真机上是失效的
+//     （镜像名一路变成 CheatKit (2).dylib 就是证据）。
+//   ★ 也不用 _dyld_image_count/_dyld_get_image_name 的 hook 版：
+//     此刻还什么都没 hook，拿到的是系统原函数。
+static int ck_self_image_index(void) {
+    Dl_info info;
+    if (!dladdr((const void *)&g_cheatkit_instance_guard, &info)) return -1;
+    if (!info.dli_fbase) return -1;
+
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        if ((const void *)_dyld_get_image_header(i) == info.dli_fbase)
+            return (int)i;
+    }
+    return -1;
+}
+
+// basename 是否以 "CheatKit" 开头（同时匹配 CheatKit.dylib / CheatKit (1).dylib）
+static BOOL ck_image_is_ours(const char *path) {
+    if (!path) return NO;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return strncmp(base, "CheatKit", 8) == 0;
+}
+
+// 统计同类镜像总数，并返回第一个的序号
+static int ck_count_our_images(uint32_t *totalOut) {
+    uint32_t cnt = _dyld_image_count();
+    int first = -1;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        if (ck_image_is_ours(_dyld_get_image_name(i))) {
+            if (first < 0) first = (int)i;
+            total++;
+        }
+    }
+    if (totalOut) *totalOut = total;
+    return first;
+}
+
 static BOOL ck_is_duplicate_instance(void) {
-    void *self_symbol = dlsym(RTLD_DEFAULT, "g_cheatkit_instance_guard");
-    void *my_symbol = (void *)&g_cheatkit_instance_guard;
-    if (!self_symbol) return NO;
-    // 同名符号解析到别处 → 说明已有一份实例先加载了
-    return (self_symbol != my_symbol);
+    int self = ck_self_image_index();
+    uint32_t total = 0;
+    int first = ck_count_our_images(&total);
+
+    if (total <= 1 || self < 0) return NO;
+
+    // 多份副本里只让 dyld 加载顺序最靠前的那份干活
+    return (first >= 0 && first != self);
 }
 
 __attribute__((constructor))
@@ -173,9 +221,15 @@ static void CheatKitInit(void) {
     @autoreleasepool {
         NSString *bid = CKCurrentBundleID();
 
+        uint32_t ourImages = 0;
+        ck_count_our_images(&ourImages);
+        if (ourImages > 1) {
+            CKLog(@"[注入] ★ 检测到 %u 份 CheatKit 镜像同时加载（CheatKit.dylib / "
+                  @"CheatKit (1).dylib / …）。多份会重复装 hook、并发改写 objc "
+                  @"method cache，必崩。请到注入工具里只保留一份。", ourImages);
+        }
         if (ck_is_duplicate_instance()) {
-            CKLog(@"[注入] 检测到重复实例（同名 dylib 被注入多次），本次跳过。"
-                  @"请到注入工具里删掉多余的 CheatKit 副本（镜像名带 (1) 的那个）");
+            CKLog(@"[注入] 本份不是第一份，跳过（只让 dyld 加载顺序最靠前的那份干活）");
             return;
         }
 
