@@ -37,6 +37,7 @@ BUILD="build"
 SOURCES=(
     "src/CheatKit.m"
     "src/Common/Log.m"
+    "src/Common/AutoPilot.m"
     "src/Common/SubstrateRT.m"
     "src/Common/Stats.m"
     "src/Common/Overlay.m"

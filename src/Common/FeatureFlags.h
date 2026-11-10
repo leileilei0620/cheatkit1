@@ -39,6 +39,7 @@ typedef NS_ENUM(NSInteger, CKFeature) {
     CKFeatureAntiDebug,         // 反调试                重启生效
     CKFeatureDyldHide,          // dyld 镜像隐藏         重启生效
     CKFeatureNetTamper,         // 网络响应篡改          重启生效
+    CKFeatureAutoPilot,         // AI 自动调参           即时生效（关掉=完全手调）
     CKFeatureCount
 };
 
@@ -79,6 +80,10 @@ const  CKParamDef *CKParamDefFor(const char *key);
 #define CKP_CLICK_MIN    "click.min"
 #define CKP_CLICK_MAX    "click.max"
 #define CKP_FP_ROTATE    "fingerprint.rotate"
+
+// 自动调参（AI）的两个旋钮，浮窗里也是滑块
+#define CKP_AP_AGGR      "ap.aggr"            // 激进程度 0~1，一条曲线推 6 个参数
+#define CKP_AP_TARGET    "ap.target"          // 目标发奖速率（次/分钟）
 
 // 把当前所有设置打一份日志（排查用）
 void CKDumpFeatures(void);

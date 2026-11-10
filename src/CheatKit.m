@@ -30,6 +30,7 @@
 #import "Common/SubstrateRT.h"     // 运行时 hook 能力探测
 #import "Common/Fingerprint.h"
 #import "Common/AntiDetect.h"
+#import "Common/AutoPilot.h"
 #import "Modules/AdEngine.h"
 #import "Modules/HookReward.h"
 #import "Modules/HookEcpm.h"
@@ -73,6 +74,16 @@ static void ck_bootstrap_target_app(void) {
 
 #if ENABLE_SDK_SCAN
     CKDumpAdSDKs();
+#endif
+
+    // ★ 自动调参放最后：它要读 AdEngine/HookReward 装完之后的统计
+    //   （hook 数、发奖速率），太早启动只能采到 0，会误判成「没 hook」。
+#if ENABLE_AUTOPILOT
+    if (CKFeatureGet(CKFeatureAutoPilot)) {
+        CKAPStart();
+    } else {
+        CKLog(@"[AI] 自动调参已关闭（浮窗里可打开）");
+    }
 #endif
 
     CKLog(@"========== 就绪，SDK: %@ ==========",

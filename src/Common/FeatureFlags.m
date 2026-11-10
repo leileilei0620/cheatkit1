@@ -34,6 +34,11 @@ static BOOL ck_factoryDefault(CKFeature f) {
         case CKFeatureAntiDebug:      return ENABLE_ANTI_DEBUG ? YES : NO;
         case CKFeatureDyldHide:       return ENABLE_DYLD_HIDE ? YES : NO;
         case CKFeatureNetTamper:      return ENABLE_NET_TAMPER ? YES : NO;
+#if ENABLE_AUTOPILOT
+        case CKFeatureAutoPilot:      return YES;
+#else
+        case CKFeatureAutoPilot:      return NO;
+#endif
         default: return NO;
     }
 }
@@ -48,6 +53,7 @@ static const char *ck_featureKey(CKFeature f) {
         case CKFeatureAntiDebug:     return "feat.antidbg";
         case CKFeatureDyldHide:      return "feat.dyldhide";
         case CKFeatureNetTamper:     return "feat.nettamper";
+        case CKFeatureAutoPilot:     return "feat.autopilot";
         default: return "feat.unknown";
     }
 }
@@ -100,6 +106,7 @@ NSString *CKFeatureName(CKFeature f) {
         case CKFeatureAntiDebug:     return @"反调试";
         case CKFeatureDyldHide:      return @"镜像隐藏";
         case CKFeatureNetTamper:     return @"网络篡改";
+        case CKFeatureAutoPilot:     return @"AI 自动调参";
         default: return @"?";
     }
 }
@@ -110,6 +117,7 @@ BOOL CKFeatureIsLive(CKFeature f) {
         case CKFeatureEcpmTamper:
         case CKFeatureFingerprint:
         case CKFeatureOverlay:
+        case CKFeatureAutoPilot:
             return YES;      // trampoline 里实时判定
         default:
             return NO;       // 装 hook 时机类，改了要重启 App
@@ -131,6 +139,10 @@ const CKParamDef kCKParams[] = {
     { CKP_CLICK_MIN,    "点击延迟下限",  0,  5000,  10,  CLICK_DELAY_MIN_MS,     YES },
     { CKP_CLICK_MAX,    "点击延迟上限",  0,  8000,  10,  CLICK_DELAY_MAX_MS,     YES },
     { CKP_FP_ROTATE,    "启动换指纹",    0,  1,     1,   ROTATE_EVERY_LAUNCH,    YES },
+#if ENABLE_AUTOPILOT
+    { CKP_AP_AGGR,      "AI 激进程度",   0,  1,     0.05, AUTOPILOT_START_AGGR,  NO  },
+    { CKP_AP_TARGET,    "AI 目标速率",   0.5, 30,   0.5, AUTOPILOT_TARGET_RATE,  NO  },
+#endif
 };
 const size_t kCKParamCount = sizeof(kCKParams) / sizeof(kCKParams[0]);
 

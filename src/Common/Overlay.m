@@ -23,12 +23,15 @@
 #import "Stats.h"
 #import "Log.h"
 #import "FeatureFlags.h"
+#import "AutoPilot.h"
 #import "../Config.h"
 #import "../Modules/AdEngine.h"
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <string.h>        // strcmp（AI 曲线滑块判定）
+#import <math.h>          // round / lround
 
 static UIColor *ck_green(void) { return [UIColor colorWithRed:0.2 green:0.95 blue:0.55 alpha:1.0]; }
 static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0]; }
@@ -116,6 +119,17 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
     if (_feature == CKFeatureOverlay && !_sw.on) {
         CKLog(@"[浮窗] 已关闭，下次启动 App 不再显示（本次运行仍保留，用 ✕ 可临时隐藏）");
     }
+#if ENABLE_AUTOPILOT
+    // ★ AI 开关的语义是「即时生效」：打开就立刻起闭环，关掉下一拍自然停
+    if (_feature == CKFeatureAutoPilot) {
+        if (_sw.on) {
+            CKAPStart();
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"CKAPCurveApplied" object:nil];
+        } else {
+            CKLog(@"[浮窗] AI 自动调参已关，参数保持当前值不再自动变");
+        }
+    }
+#endif
 }
 
 @end
@@ -178,6 +192,15 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
     }
     CKParamSet(_def->key, v);
     [self updateValueLabel];
+
+#if ENABLE_AUTOPILOT
+    // ★ 拖「AI 激进程度」时把曲线一次性铺开，其余滑块跟着动
+    //   所以拖完要通知设置面板重刷一遍滑块位置，否则显示的还是旧值。
+    if (strcmp(_def->key, CKP_AP_AGGR) == 0) {
+        CKAPApplyCurveNow(v);
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"CKAPCurveApplied" object:nil];
+    }
+#endif
 }
 
 @end
@@ -188,6 +211,14 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
 @interface CKSettingsView : UIView
 @property (nonatomic, strong) UIScrollView *scroll;
 @property (nonatomic, strong) NSMutableArray *rows;
+#if ENABLE_AUTOPILOT
+@property (nonatomic, strong) UILabel *apLabel;
+// 私有方法前置声明：避免调用点早于定义时产生
+// "instance method not found (return type defaults to 'id')" 警告
+- (void)doTickAllSliders;
+- (void)refreshAPLabel;
+- (void)onCurveApplied;
+#endif
 @end
 
 @implementation CKSettingsView
@@ -260,6 +291,56 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
             y += 48;
         }
 
+        // ---- AI 自动调参 ----
+#if ENABLE_AUTOPILOT
+        y += 6;
+        UILabel *sec3 = [[UILabel alloc] initWithFrame:CGRectMake(10, y, innerW, 16)];
+        sec3.font = [UIFont boldSystemFontOfSize:11];
+        sec3.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+        sec3.text = @"— AI 自动调参 —";
+        [_scroll addSubview:sec3];
+        y += 20;
+
+        UILabel *apHint = [[UILabel alloc] initWithFrame:CGRectMake(10, y, innerW, 30)];
+        apHint.numberOfLines = 0;
+        apHint.font = [UIFont systemFontOfSize:10];
+        apHint.textColor = [UIColor colorWithWhite:0.5 alpha:1.0];
+        apHint.text = @"上面的「AI 激进程度」一条曲线同时推倍率/冷却/观看/点击 6 个参数。"
+                       "开着会自动朝目标速率收敛；关掉就是纯手动。";
+        [_scroll addSubview:apHint];
+        y += 34;
+
+        UIButton *apResume = [UIButton buttonWithType:UIButtonTypeSystem];
+        apResume.frame = CGRectMake(10, y, (innerW - 8) / 2, 32);
+        [apResume setTitle:@"恢复自动" forState:UIControlStateNormal];
+        [apResume setTitleColor:ck_green() forState:UIControlStateNormal];
+        apResume.titleLabel.font = [UIFont systemFontOfSize:12];
+        apResume.layer.borderWidth = 0.5;
+        apResume.layer.borderColor = ck_green().CGColor;
+        apResume.layer.cornerRadius = 6;
+        [apResume addTarget:self action:@selector(doAPResume) forControlEvents:UIControlEventTouchUpInside];
+        [_scroll addSubview:apResume];
+
+        UIButton *apTick = [UIButton buttonWithType:UIButtonTypeSystem];
+        apTick.frame = CGRectMake(10 + (innerW + 8) / 2, y, (innerW - 8) / 2, 32);
+        [apTick setTitle:@"立即调整" forState:UIControlStateNormal];
+        [apTick setTitleColor:ck_green() forState:UIControlStateNormal];
+        apTick.titleLabel.font = [UIFont systemFontOfSize:12];
+        apTick.layer.borderWidth = 0.5;
+        apTick.layer.borderColor = ck_green().CGColor;
+        apTick.layer.cornerRadius = 6;
+        [apTick addTarget:self action:@selector(doAPTick) forControlEvents:UIControlEventTouchUpInside];
+        [_scroll addSubview:apTick];
+        y += 40;
+
+        _apLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, y, innerW, 30)];
+        _apLabel.numberOfLines = 0;
+        _apLabel.font = [UIFont fontWithName:@"Menlo" size:9] ?: [UIFont systemFontOfSize:9];
+        _apLabel.textColor = ck_dim();
+        [_scroll addSubview:_apLabel];
+        y += 34;
+#endif
+
         // ---- 重置 ----
         y += 6;
         UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -275,9 +356,28 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
         y += 42;
 
         _scroll.contentSize = CGSizeMake(w, y);
+
+#if ENABLE_AUTOPILOT
+        // 拖「AI 激进程度」会让 6 个参数一起变，这里监听并重刷其余滑块
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onCurveApplied)
+                                                     name:@"CKAPCurveApplied"
+                                                   object:nil];
+#endif
     }
     return self;
 }
+
+#if ENABLE_AUTOPILOT
+- (void)onCurveApplied {
+    [self doTickAllSliders];
+    [self refreshAPLabel];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+#endif
 
 - (void)goBack {
     self.hidden = YES;
@@ -297,7 +397,45 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
         }
     }
     CKLog(@"[浮窗] 参数已恢复默认");
+#if ENABLE_AUTOPILOT
+    [self refreshAPLabel];
+#endif
 }
+
+#if ENABLE_AUTOPILOT
+- (void)doAPResume {
+    CKAPResume();
+    [self doTickAllSliders];
+    [self refreshAPLabel];
+    CKLog(@"[浮窗] AI 已恢复自动");
+}
+
+- (void)doAPTick {
+    CKAPTickNow();
+    // 采样是异步的（在 AI 队列上跑），1.5 秒后再刷一次标签
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self doTickAllSliders];
+        [self refreshAPLabel];
+    });
+}
+
+- (void)doTickAllSliders {
+    for (id r in _rows) {
+        if ([r isKindOfClass:[CKSliderRow class]]) {
+            CKSliderRow *s = (CKSliderRow *)r;
+            s.slider.value = (float)CKParamGet(s.def->key);
+            [s updateValueLabel];
+        }
+    }
+}
+
+- (void)refreshAPLabel {
+    if (!_apLabel) return;
+    _apLabel.text = [NSString stringWithFormat:@"%@\n%@",
+                     CKAPStatusLine(), CKAPLastReason()];
+}
+#endif
 
 // 每次显示时同步一次开关状态（可能在别处改过）
 - (void)syncSwitches {
@@ -307,6 +445,9 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
             t.sw.on = CKFeatureGet(t.feature);
         }
     }
+#if ENABLE_AUTOPILOT
+    [self refreshAPLabel];
+#endif
 }
 
 @end
@@ -381,7 +522,7 @@ static CKOverlayView   *g_view   = nil;
         [self addSubview:_closeBtn];
 
         // 数据区
-        _bodyLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 26, w - 20, 92)];
+        _bodyLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 26, w - 20, 104)];
         _bodyLabel.numberOfLines = 0;
         _bodyLabel.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
         _bodyLabel.textColor = [UIColor whiteColor];
@@ -520,8 +661,8 @@ static CKOverlayView   *g_view   = nil;
     _gearBtn.frame      = CGRectMake(w - 92, 2, 30, 26);
     _collapseBtn.frame  = CGRectMake(w - 62, 2, 28, 26);
     _closeBtn.frame     = CGRectMake(w - 32, 2, 28, 26);
-    _bodyLabel.frame    = CGRectMake(10, 26, w - 20, 92);
-    _logLabel.frame     = CGRectMake(10, 122, w - 20, h - 128);
+    _bodyLabel.frame    = CGRectMake(10, 26, w - 20, 104);
+    _logLabel.frame     = CGRectMake(10, 134, w - 20, h - 140);
 }
 
 // ---- 每秒刷新 ----
@@ -546,6 +687,9 @@ static CKOverlayView   *g_view   = nil;
     [b appendFormat:@"hook 奖%d 播%d 失%d 跳%d\n",
         s.rewardHooks, s.playHooks, s.failHooks, s.skipped];
     [b appendFormat:@"eCPM %d 次   发奖 %d 次\n", s.ecpmHits, s.rewardsFired];
+#if ENABLE_AUTOPILOT
+    [b appendFormat:@"%@\n", CKAPStatusLine()];
+#endif
     [b appendFormat:@"开关 %@   运行 %.0fs", flags, s.uptime];
 
     _bodyLabel.text = b;
