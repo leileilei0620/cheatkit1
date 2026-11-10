@@ -1,0 +1,141 @@
+name: Build Dylib
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 编译 CheatKit.dylib
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 静态自检（不用 SDK，先挡语法错）
+        run: python3 selfcheck.py
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential make git curl ca-certificates \
+            clang lld llvm \
+            libplist-dev libssl-dev libxml2-dev libncurses-dev zlib1g-dev \
+            xz-utils dpkg fakeroot file perl
+          echo "--- clang ---"
+          clang --version | head -2
+          echo "--- lld ---"
+          ls -l /usr/bin/ld64.lld /usr/bin/ld.lld 2>/dev/null || true
+          LIPO=$(ls /usr/bin/llvm-lipo* 2>/dev/null | head -1)
+          if [ -n "$LIPO" ]; then
+            sudo ln -sf "$LIPO" /usr/local/bin/lipo
+            echo "lipo -> $LIPO"
+          fi
+
+      - name: 编译 ldid（伪签名工具，Linux 版）
+        run: |
+          set -e
+          sudo apt-get install -y --no-install-recommends libssl-dev libplist-dev
+          git clone --depth 1 --recursive https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+          cd /tmp/ldid
+          make -j"$(nproc)" CXX=clang++ CC=clang 2>&1 | tail -20
+          if [ -f ./ldid ]; then
+            sudo cp ./ldid /usr/local/bin/
+          else
+            echo "ldid 编译失败，装发行版版本兜底"
+            sudo apt-get install -y --no-install-recommends ldid || true
+          fi
+          ldid -v 2>&1 | head -3 || echo "ldid 不可用（伪签名会跳过，dylib 仍能出）"
+
+      # theos/sdks 仓库里 SDK 是【目录】，不是 .sdk.tar.xz 压缩包。
+      # 用 blobless + sparse-checkout 只拉一个 SDK，避免整仓几百 MB。
+      - name: 安装 iOS SDK（稀疏克隆，只取一个）
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/theos/sdks"
+          cd /tmp
+          rm -rf sdk-repo
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git sdk-repo
+          cd sdk-repo
+
+          PICKED=""
+          for v in iPhoneOS16.5.sdk iPhoneOS15.6.sdk iPhoneOS14.5.sdk; do
+            echo "--- 尝试 $v ---"
+            git sparse-checkout set "$v" || continue
+            if [ -d "$v/System/Library/Frameworks/Foundation.framework" ]; then
+              PICKED="$v"
+              break
+            fi
+            echo "$v 不完整，换下一个"
+          done
+
+          if [ -z "$PICKED" ]; then
+            echo "没有拿到任何可用 SDK"
+            exit 1
+          fi
+
+          echo "选用 SDK: $PICKED"
+          cp -a "$PICKED" "$HOME/theos/sdks/"
+          echo "--- theos/sdks 目录 ---"
+          ls -1 "$HOME/theos/sdks"
+          test -d "$HOME/theos/sdks/$PICKED/System/Library/Frameworks/Foundation.framework" \
+            || { echo "SDK 里没有 Foundation.framework，不完整"; exit 1; }
+          echo "SDK 校验通过"
+
+      - name: 打印环境（编译失败时先看这段）
+        run: |
+          echo "--- 工具 ---"
+          command -v ldid lipo clang ld64.lld || true
+          echo "--- 源文件 ---"
+          ls -1 src src/Common src/Modules src/vendor
+
+      # ==========================================================
+      #  直接出裸 dylib（不再打包 deb）
+      #  arm64e 在 Linux clang 上偶尔不支持，脚本内部会自动跳过
+      # ==========================================================
+      - name: 编译 dylib
+        id: build
+        run: |
+          chmod +x build_dylib.sh
+          ./build_dylib.sh
+
+      - name: 检查产物
+        run: |
+          set -e
+          DY=$(ls build/CheatKit.dylib 2>/dev/null | head -1)
+          if [ -z "$DY" ]; then echo "没有生成 dylib"; exit 1; fi
+          ls -lh build/
+          echo "--- 文件类型 ---"
+          file "$DY" || true
+          echo "--- 架构 ---"
+          lipo -info "$DY" 2>/dev/null || true
+          echo "--- install_name ---"
+          strings "$DY" | grep -m1 'executable_path' || echo "（未找到 install_name 字符串）"
+          echo "--- 大小 ---"
+          stat -c '%s bytes' "$DY"
+
+      - name: 上传 dylib（在 Actions 页面下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: CheatKit-dylib
+          path: build/CheatKit.dylib
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 打 tag 时发 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/CheatKit.dylib
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
