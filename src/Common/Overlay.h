@@ -28,4 +28,8 @@ void CKInstallOverlay(void);
 // 手动刷新一次（一般不用调，浮窗自己每秒刷）
 void CKRefreshOverlay(void);
 
+// 跑一次自检：把注入/hook/SDK/补发链的诊断打到日志区
+// 自动调用：注入后 8 秒跑一次（用户还没点广告时就能看出装没装上）
+void CKRunSelfCheck(void);
+
 #endif

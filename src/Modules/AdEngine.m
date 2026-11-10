@@ -343,6 +343,36 @@ static inline BOOL ck_rewardOn(void) { return CKFeatureGet(CKFeatureRewardForce)
 //     CKSlotPlay   —— 播放/倒计时入口：真正的掐表点，延时补发
 //     CKSlotReward —— 奖励回调本身：只登记 delegate，绝不二次补发
 //                     （否则一支广告发两次奖，游戏侧 dismiss 撞车 → 闪退）
+// ============================================================
+//  改 BOOL 参数前的最后一道闸
+//
+//  trampoline 会把 BOOL 参数从 NO 改成 YES（「必填校验没过 → 让它过」）。
+//  但如果这个 SEL 本身就是失败回调（名字含 fail/error/cancel/...），
+//  把它的 BOOL 从 NO 改 YES 会让 SDK 以为「成功了」，随后去取不存在的数据
+//  —— 表现就是黑屏、播不动、或者拿不到广告内容。
+//
+//  典型踩过的坑：rewardedVideoAdDidFailWithError: 同时含 "reward" 和 "fail"，
+//  旧版本按 reward 优先判定，把失败标志改成了成功。
+//
+//  所以这里按 SEL 名再兜一次：只要名字里带失败语义，一个参数都不改。
+//  开销：每次广告回调一次 strcasestr 链，广告回调频率极低，可以忽略。
+// ============================================================
+static BOOL ck_safeToForceBool(SEL sel) {
+    if (!sel) return NO;
+    const char *n = sel_getName(sel);
+    if (!n) return NO;
+    static const char *blocked[] = {
+        "fail", "error", "cancel", "skip", "close", "interrupt",
+        "timeout", "nofill", "no_fill", "abort", "deny", "reject"
+    };
+    for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
+        if (ck_strcasestr(n, blocked[i])) return NO;
+    }
+    // 复合方法（播完 + 失败）第二个参数是 NSError，改 BOOL 没有意义也不安全
+    if (ck_strcasestr(n, "didfailwitherror")) return NO;
+    return YES;
+}
+
 static void ck_postAction(id self, SEL sel, id arg) {
     if (!ck_rewardOn()) return;
     CKSlot *slot = ck_slotFor(self, sel);
@@ -382,7 +412,7 @@ static void ck_h1(id self, SEL _cmd, id a) {
 static void ck_h2_ib(id self, SEL _cmd, id a, BOOL b) {
     CKSlot *slot = ck_slotFor(self, _cmd);
     IMP o = slot ? slot->orig : NULL;
-    if (ck_rewardOn() && !b) {
+    if (ck_rewardOn() && !b && ck_safeToForceBool(_cmd)) {
         CKLog(@"[引擎] -%s 参数2 NO -> YES", sel_getName(_cmd));
         b = YES;
     }
@@ -398,7 +428,7 @@ static void ck_h2_ii(id self, SEL _cmd, id a, id b) {
 static void ck_h2_in(id self, SEL _cmd, id a, NSInteger b) {
     CKSlot *slot = ck_slotFor(self, _cmd);
     IMP o = slot ? slot->orig : NULL;
-    if (ck_rewardOn() && b == 0) b = 1;
+    if (ck_rewardOn() && b == 0 && ck_safeToForceBool(_cmd)) b = 1;
     ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id, NSInteger))o)(self, _cmd, a, b);
 }
@@ -411,7 +441,7 @@ static void ck_h3_iii(id self, SEL _cmd, id a, id b, id c) {
 static void ck_h3_ibi(id self, SEL _cmd, id a, BOOL b, id c) {
     CKSlot *slot = ck_slotFor(self, _cmd);
     IMP o = slot ? slot->orig : NULL;
-    if (ck_rewardOn() && !b) {
+    if (ck_rewardOn() && !b && ck_safeToForceBool(_cmd)) {
         CKLog(@"[引擎] -%s 参数2 NO -> YES", sel_getName(_cmd));
         b = YES;
     }
@@ -421,7 +451,7 @@ static void ck_h3_ibi(id self, SEL _cmd, id a, BOOL b, id c) {
 static void ck_h3_iib(id self, SEL _cmd, id a, id b, BOOL c) {
     CKSlot *slot = ck_slotFor(self, _cmd);
     IMP o = slot ? slot->orig : NULL;
-    if (ck_rewardOn() && !c) {
+    if (ck_rewardOn() && !c && ck_safeToForceBool(_cmd)) {
         CKLog(@"[引擎] -%s 参数3 NO -> YES", sel_getName(_cmd));
         c = YES;
     }

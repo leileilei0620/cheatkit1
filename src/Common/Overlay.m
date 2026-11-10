@@ -241,6 +241,22 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
         title.text = @"功能开关 / 参数";
         [self addSubview:title];
 
+        // ★ 自检按钮放在标题条上，常驻可见。
+        //   之前放在 _scroll 底部（y 累计到 900+），面板只有 430 高，
+        //   用户要滚很久才看得到，等于没有。
+        UIButton *selfCheck = [UIButton buttonWithType:UIButtonTypeSystem];
+        selfCheck.frame = CGRectMake(w - 74, 4, 32, 28);
+        [selfCheck setTitle:@"?" forState:UIControlStateNormal];
+        [selfCheck setTitleColor:[UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1.0]
+                        forState:UIControlStateNormal];
+        selfCheck.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+        selfCheck.layer.borderColor = [UIColor colorWithRed:0.3 green:0.8 blue:0.5 alpha:0.7].CGColor;
+        selfCheck.layer.borderWidth = 1;
+        selfCheck.layer.cornerRadius = 6;
+        [selfCheck addTarget:self action:@selector(doSelfCheck)
+            forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:selfCheck];
+
         // 关闭按钮（回到状态面板）
         UIButton *back = [UIButton buttonWithType:UIButtonTypeSystem];
         back.frame = CGRectMake(w - 40, 4, 32, 28);
@@ -353,20 +369,6 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
         reset.layer.cornerRadius = 6;
         [reset addTarget:self action:@selector(doReset) forControlEvents:UIControlEventTouchUpInside];
 
-        // ---- 自检（不用查 Console，点一下把诊断打到浮窗日志区）----
-        y += 40;
-        UIButton *diag = [UIButton buttonWithType:UIButtonTypeSystem];
-        diag.frame = CGRectMake(10, y, innerW, 32);
-        [diag setTitle:@"自检" forState:UIControlStateNormal];
-        [diag setTitleColor:[UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1.0]
-                   forState:UIControlStateNormal];
-        diag.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-        diag.layer.borderColor = [UIColor colorWithRed:0.3 green:0.8 blue:0.5 alpha:0.8].CGColor;
-        diag.layer.borderWidth = 1;
-        diag.layer.cornerRadius = 6;
-        [diag addTarget:self action:@selector(doSelfCheck) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:diag];
-        y += 40;
         [_scroll addSubview:reset];
         y += 42;
 
@@ -402,7 +404,8 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
 
 // ---- 自检：把所有关键诊断一次性打到浮窗日志区 ----
 //   用户不用连 Console，点一下就能看「卡在哪一步」。
-- (void)doSelfCheck {
+// 自检核心：不依赖面板，随时可调（安装后自动跑一次 + 按钮手动跑）
+void CKRunSelfCheck(void) {
     CKStatsSnapshot st = CKStatsGet();
     NSArray *sdks = CKDetectedSDKs();
 
@@ -436,6 +439,9 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
     }
     CKLog(@"[自检] 结论：%@", verdict);
 }
+
+// 按钮入口
+- (void)doSelfCheck { CKRunSelfCheck(); }
 
 - (void)doReset {
     for (size_t i = 0; i < kCKParamCount; i++) {
@@ -939,6 +945,15 @@ void CKInstallOverlay(void) {
 
     if ([NSThread isMainThread]) build();
     else dispatch_async(dispatch_get_main_queue(), build);
+
+    // ★ 注入后 8 秒自动跑一次自检，不需要用户点按钮。
+    //   为什么等 8 秒：广告 SDK 通常在 App 启动后几秒才初始化，
+    //   太早跑会看到「广告类 0 / SDK 未识别」，反而误导。
+    //   自检结果直接写进浮窗日志区，用户一睁眼就能看到结论。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        CKRunSelfCheck();
+    });
 
     // 场景后到的情况：App 切到前台时再试一次（幂等）
     [[NSNotificationCenter defaultCenter]

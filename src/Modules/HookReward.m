@@ -25,9 +25,13 @@
 // ============================================================
 //  精确 hook 表：每个 SEL 标明意图
 //    CKKindReward —— 参数里的 BOOL（verify/valid）强制 YES
-//    CKKindPlay   —— 广告开始播，排程补发奖励
+//    CKKindPlay   —— 广告播完了，排程补发奖励（唯一合法补发点）
 // ============================================================
-typedef enum { CKKindReward = 1, CKKindPlay = 2 } CKKind;
+typedef enum {
+    CKKindReward        = 1,   // 奖励/校验回调：只登记 delegate，绝不补发
+    CKKindPlay          = 2,   // 纯「播完了」：无条件下补发
+    CKKindPlayIfNoError = 3    // 「播完或播失败」的复合方法：只有失败参数为 nil 才补发
+} CKKind;
 
 typedef struct {
     const char *clsName;   // 目标类；NULL 表示全局按 SEL 扫
@@ -39,9 +43,14 @@ static const CKExactRule kExactRules[] = {
     // ---------- 穿山甲 / Pangle ----------
     { "BURewardedVideoAd",        "rewardedVideoAdServerRewardDidSucceed:verify:", CKKindReward },
     { "BURewardedVideoAd",        "rewardedVideoAdDidRewardEffective:",            CKKindReward },
-    { "BURewardedVideoAd",        "rewardedVideoAdDidPlayFinish:didFailWithError:", CKKindPlay },
+    // ★ 这个方法名里同时有 "PlayFinish" 和 "FailWithError"：
+    //   它是「播完 / 播失败都回调」，第二个参数 error 非 nil 就表示失败。
+    //   标成 CKKindPlay 会在播放失败时也补发奖励 —— 用户没看广告也拿到奖励，
+    //   而且奖励和失败回调同时到达会让游戏侧状态错乱。
+    //   单独一个类别：只有 error == nil 才补发。
+    { "BURewardedVideoAd",        "rewardedVideoAdDidPlayFinish:didFailWithError:", CKKindPlayIfNoError },
     { "BURewardedVideoAdManager", "rewardedVideoAdServerRewardDidSucceed:verify:", CKKindReward },
-    { "BURewardedVideoAdManager", "rewardedVideoAdDidPlayFinish:didFailWithError:", CKKindPlay },
+    { "BURewardedVideoAdManager", "rewardedVideoAdDidPlayFinish:didFailWithError:", CKKindPlayIfNoError },
     { "BUAdRewardedVideoManager", "rewardedVideoAdServerRewardDidSucceed:verify:", CKKindReward },
     { "PAGRewardedAd",            "adDidReward:",                                  CKKindReward },
     { "PAGRewardedAd",            "ad:didReward:",                                 CKKindReward },
@@ -60,7 +69,8 @@ static const CKExactRule kExactRules[] = {
     // ---------- 百度联盟 ----------
     { "BaiduMobAdRewardVideo",    "rewardedAdDidSuccessful:",                      CKKindReward },
     { "BaiduMobAdRewardVideo",    "rewardedAdDidReward:",                          CKKindReward },
-    { "BaiduMobAdRewardVideo",    "rewardedAdDidClose:",                           CKKindPlay },
+    // ★ 刻意不 hook didClose：用户中途点 ✕ 关掉广告也会回调这个。
+    //   当补发点等于「关掉就给奖励」。
 
     // ---------- Google AdMob ----------
     { "GADRewardedAd",            "rewardedAd:userDidEarnReward:",                 CKKindReward },
@@ -79,7 +89,7 @@ static const CKExactRule kExactRules[] = {
     { "MTRewardedVideoAd",        "rewardVideoAdDidReceiveReward:",                CKKindReward },
 
     // ---------- UnityAds ----------
-    { "UADSRewardedAd",           "rewardedAdDidComplete:",                        CKKindReward },
+    { "UADSRewardedAd",           "rewardedAdDidComplete:",                        CKKindPlay },
 
     // ---------- Vungle / Liftoff ----------
     { "VNGRewardedAd",            "rewardedAdDidReward:",                          CKKindReward },
@@ -88,11 +98,13 @@ static const CKExactRule kExactRules[] = {
     { "SMRewardedVideoAd",        "sigmob_rewardVideoAdDidRewardEffective:info:",  CKKindReward },
 
     // ---------- Chartboost ----------
-    { "CHBRewarded",              "didCompleteRewardedVideo:withReward:",          CKKindReward },
+    { "CHBRewarded",              "didCompleteRewardedVideo:withReward:",          CKKindPlay },
 
     // ---------- TopOn / AnyThink ----------
     { "ATRewardedVideoAd",        "rewardedVideoDidRewardSuccessForPlacements:withExtra:", CKKindReward },
-    { "ATRewardedVideoAd",        "rewardedVideoDidStartPlayingForPlacements:extra:",      CKKindPlay },
+    // ★ 刻意不 hook 这条：方法名是 DidStartPlaying（开始播放）。
+    //   当补发点 = 广告一开始播就发奖，用户根本没看完。
+    //   原实现挂在 CKKindPlay 上，这是「没看完也发奖」的直接来源之一。
 
     // ---------- TradPlus ----------
     { "TradPlusRewardedVideoAd",  "tpRewardedVideoDidReward:reward:",              CKKindReward },
@@ -134,8 +146,8 @@ static const CKExactRule kExactRules[] = {
     { "WindCountdown",            "countdownDidFinish:",                           CKKindPlay },
 
     // ---------- H5 / 可玩广告（Web 层计时） ----------
-    { "KSAdWebReward",            "webViewDidFinishLoad:",                         CKKindPlay },
-    { "GDTRewardVideoAd",         "gdt_rewardVideoAdDidPlayFinish:",               CKKindPlay },
+    // ★ 刻意不 hook webViewDidFinishLoad：H5 页面「加载完成」不等于「看完了」。
+    //   当补发点等于广告一显示就给奖励。H5 广告的计时在 JS 里，得 hook JS 侧。
 };
 static const size_t kRuleCount = sizeof(kExactRules) / sizeof(kExactRules[0]);
 
@@ -179,6 +191,22 @@ static CKExactSlot *ck_findExact(id self, SEL sel) {
 // ============================================================
 static inline BOOL ck_rewardForceOn(void) { return CKFeatureGet(CKFeatureRewardForce); }
 
+// SEL 名里带失败语义时，绝不动它的 BOOL 参数（理由见 AdEngine.m 的 ck_safeToForceBool）。
+static BOOL ck_safeToForceBool(SEL sel) {
+    if (!sel) return NO;
+    const char *n = sel_getName(sel);
+    if (!n) return NO;
+    static const char *blocked[] = {
+        "fail", "error", "cancel", "skip", "close", "interrupt",
+        "timeout", "nofill", "no_fill", "abort", "deny", "reject"
+    };
+    for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
+        if (ck_strcasestr(n, blocked[i])) return NO;
+    }
+    if (ck_strcasestr(n, "didfailwitherror")) return NO;
+    return YES;
+}
+
 static void ck_ex_0(id self, SEL _cmd) {
     CKExactSlot *s = ck_findExact(self, _cmd);
     if (!s) return;
@@ -196,10 +224,13 @@ static void ck_ex_1(id self, SEL _cmd, id a) {
 static void ck_ex_1b(id self, SEL _cmd, BOOL b) {
     CKExactSlot *s = ck_findExact(self, _cmd);
     if (!s) return;
+    // ★ 单参 BOOL 形状判不出「成功还是失败」（有的 SDK true=成功，有的 true=失败），
+    //   所以 CKKindPlayIfNoError 在这一形状下保守不补发 —— 宁可少发一次，
+    //   也不要在播放失败时误发奖励。
     if (s->kind == CKKindPlay && ck_rewardForceOn()) {
         CKTryScheduleReward(self, 1.0);
     }
-    if (ck_rewardForceOn() && !b) {
+    if (ck_rewardForceOn() && !b && ck_safeToForceBool(_cmd)) {
         CKLog(@"[精确] -%s verify NO -> YES", sel_getName(_cmd));
         b = YES;
     }
@@ -212,9 +243,20 @@ static void ck_ex_2(id self, SEL _cmd, id a, id b) {
     // ★ CKKindPlay 必须在 orig 之前补发（两参形状也要处理）。
     //   漏了这一段的话，所有「2 参的播放结束回调」都不会补发，
     //   表现就是「有的软件看完没奖励」——因为它走的正是两参形状。
-    if (s->kind == CKKindPlay && ck_rewardForceOn()) {
+    // ★ 两参形状：第二个参数常是 NSError / 失败标志。
+    //   CKKindPlay          → 无条件补发（纯播完回调）
+    //   CKKindPlayIfNoError → 第二个参数是 nil 才补发（复合方法，失败时不能发奖）
+    BOOL shouldReward = NO;
+    if (s->kind == CKKindPlay) {
+        shouldReward = YES;
+    } else if (s->kind == CKKindPlayIfNoError) {
+        shouldReward = (b == nil);      // 有 error 对象 = 播失败，绝不补发
+    }
+    if (shouldReward && ck_rewardForceOn()) {
         CKLog(@"[精确] 播完 -%s，排程补发", sel_getName(_cmd));
         CKTryScheduleReward(self, 1.0);
+    } else if (s->kind == CKKindPlayIfNoError && b != nil && ck_rewardForceOn()) {
+        CKLog(@"[精确] 播放失败 -%s（有 error），不补发", sel_getName(_cmd));
     }
     if (s->kind == CKKindReward && ck_rewardForceOn()) {
         // ★ 这里刻意「只登记、不补发」。
@@ -234,7 +276,7 @@ static void ck_ex_2b(id self, SEL _cmd, id a, BOOL b) {
     CKExactSlot *s = ck_findExact(self, _cmd);
     if (!s) return;
     if (ck_rewardForceOn()) {
-        if (!b) { CKLog(@"[精确] -%s verify NO -> YES", sel_getName(_cmd)); b = YES; }
+        if (!b && ck_safeToForceBool(_cmd)) { CKLog(@"[精确] -%s verify NO -> YES", sel_getName(_cmd)); b = YES; }
         if (s->kind == CKKindReward) {
             // ★ 同上：只登记 delegate，不二次补发（否则一支广告发两次奖）
             id d = CKDelegateFromAdObject(self);
@@ -251,7 +293,7 @@ static void ck_ex_2ib(id self, SEL _cmd, NSInteger a, BOOL b) {
         CKLog(@"[精确] 播完 -%s，排程补发", sel_getName(_cmd));
         CKTryScheduleReward(self, 1.0);
     }
-    if (ck_rewardForceOn()) b = YES;
+    if (ck_rewardForceOn() && ck_safeToForceBool(_cmd)) b = YES;
     ((void (*)(id, SEL, NSInteger, BOOL))s->orig)(self, _cmd, a, b);
 }
 
