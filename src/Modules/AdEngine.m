@@ -213,14 +213,42 @@ typedef struct {
     CKArgKind kinds[CK_MAX_ARGS];
 } CKShape;
 
+// ============================================================
+//  解析 ObjC 方法 type encoding
+//
+//  ★★★ 这里踩过一个致命坑，别再改回去 ★★★
+//
+//  真实的 encoding 长这样：  v24@0:8@16
+//                              ↑ ↑  ↑ ↑ ↑ ↑
+//                              | |  | | | └ 参数1 的栈偏移
+//                              | |  | | └── 参数1 类型（id）
+//                              | |  | └──── _cmd 的偏移
+//                              | |  └────── _cmd
+//                              | └───────── self 的偏移
+//                              └─────────── 整个栈帧的字节数
+//
+//  也就是说 'v' 后面紧跟的是「帧大小数字」，不是 '@'。
+//  旧版本写成 `if (*p != '@') return NO;` → 每个方法都在这里返回 NO
+//  → 全部计入「跳过」→ 浮窗显示「hook 奖0 播0 跳3455」，
+//  一个 hook 都没装上，只有 fail 计数在涨（fail 判定在解析之前）。
+//
+//  所以每读一个类型码之后，都要把紧跟的数字（帧大小 / 偏移）跳掉。
+// ============================================================
+static void ck_skip_digits(const char **pp) {
+    while (**pp >= '0' && **pp <= '9') (*pp)++;
+}
+
 static BOOL ck_parseShape(const char *enc, CKShape *out) {
     if (!enc || !out) return NO;
     memset(out, 0, sizeof(*out));
     const char *p = enc;
     if (*p != 'v' && *p != 'V') return NO;
     p++;
+    ck_skip_digits(&p);              // ★ 帧大小
     if (*p != '@') return NO; p++;
+    ck_skip_digits(&p);
     if (*p != ':') return NO; p++;
+    ck_skip_digits(&p);
 
     int n = 0;
     while (*p && n < CK_MAX_ARGS) {
@@ -233,12 +261,16 @@ static BOOL ck_parseShape(const char *enc, CKShape *out) {
         if (t == '@' || t == '#') {
             k = CKArgID; p++;
             if (*p == '"') { p++; while (*p && *p != '"') p++; if (*p) p++; }
+            ck_skip_digits(&p);        // ★ 参数偏移
         } else if (t == 'c' || t == 'B') {
             k = CKArgBool; p++;
+            ck_skip_digits(&p);
         } else if (strchr("iqIslLQSC", t)) {
             k = CKArgInt; p++;
+            ck_skip_digits(&p);
         } else if (t == 'd' || t == 'f' || t == 'D' || t == '*') {
             p++;
+            ck_skip_digits(&p);
         } else if (t == '{' || t == '[') {
             char open = t, close = (t == '{') ? '}' : ']';
             int depth = 0;
@@ -267,6 +299,7 @@ static BOOL ck_parseShape(const char *enc, CKShape *out) {
         } else {
             p++;
         }
+        ck_skip_digits(&p);           // ★ 兜底：每个参数后都可能有偏移数字
         out->kinds[n++] = k;
     }
     out->argc = n;
@@ -403,6 +436,35 @@ static void ck_h0(id self, SEL _cmd) {
     ck_postAction(self, _cmd, nil);
     if (o) ((void (*)(id, SEL))o)(self, _cmd);
 }
+static void ck_h1b(id self, SEL _cmd, BOOL a) {
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
+    // 单参 BOOL：先把 delegate 登记好（ck_postAction 的 arg 传 nil 避免误当对象）
+    if (ck_rewardOn()) {
+        id d = CKDelegateFromAdObject(self);
+        if (d) CKRegisterRewardDelegate(d);
+        if (slot && slot->kind == CKSlotPlay) {
+            CKLog(@"[引擎] 播完 -%s，排程补发", sel_getName(_cmd));
+            CKTryScheduleReward(self, 1.0);
+        }
+    }
+    if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, a);
+}
+
+static void ck_h1n(id self, SEL _cmd, NSInteger a) {
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
+    if (ck_rewardOn()) {
+        id d = CKDelegateFromAdObject(self);
+        if (d) CKRegisterRewardDelegate(d);
+        if (slot && slot->kind == CKSlotPlay) {
+            CKLog(@"[引擎] 播完 -%s，排程补发", sel_getName(_cmd));
+            CKTryScheduleReward(self, 1.0);
+        }
+    }
+    if (o) ((void (*)(id, SEL, NSInteger))o)(self, _cmd, a);
+}
+
 static void ck_h1(id self, SEL _cmd, id a) {
     CKSlot *slot = ck_slotFor(self, _cmd);
     IMP o = slot ? slot->orig : NULL;
@@ -465,19 +527,41 @@ static void ck_h4_iiii(id self, SEL _cmd, id a, id b, id c, id d) {
     if (o) ((void (*)(id, SEL, id, id, id, id))o)(self, _cmd, a, b, c, d);
 }
 
+// ============================================================
+//  按参数形状选 trampoline
+//
+//  ★ 所有 trampoline 都假定「第一个参数是 id」（广告对象 / delegate / info）。
+//    如果第一个参数其实是 BOOL / NSInteger，按 id 传会把 0/1 当成指针
+//    → respondsToSelector 立刻野指针 → SIGSEGV。
+//    所以 kinds[0] 不是 CKArgID 时直接返回 NULL（跳过这个 hook，不装）。
+//
+//  ★ 1 参形状还要区分 BOOL / Int，否则 `- (void)onRewardVerify:(BOOL)`
+//    这种会被当成 id 传 → 同样崩。
+// ============================================================
 static IMP ck_pickTrampoline(CKShape sh) {
+    // argc == 0 时没有参数，不需要检查
+    if (sh.argc > 0 && sh.kinds[0] != CKArgID) return NULL;
+
     switch (sh.argc) {
         case 0: return (IMP)ck_h0;
-        case 1: return (IMP)ck_h1;
+        case 1:
+            if (sh.kinds[0] == CKArgBool) return (IMP)ck_h1b;
+            if (sh.kinds[0] == CKArgInt)  return (IMP)ck_h1n;
+            return (IMP)ck_h1;
         case 2:
             if (sh.kinds[1] == CKArgBool) return (IMP)ck_h2_ib;
             if (sh.kinds[1] == CKArgInt)  return (IMP)ck_h2_in;
+            if (sh.kinds[1] != CKArgID)   return NULL;   // 结构体/浮点，没实现
             return (IMP)ck_h2_ii;
         case 3:
             if (sh.kinds[1] == CKArgBool) return (IMP)ck_h3_ibi;
             if (sh.kinds[2] == CKArgBool) return (IMP)ck_h3_iib;
+            if (sh.kinds[1] != CKArgID || sh.kinds[2] != CKArgID) return NULL;
             return (IMP)ck_h3_iii;
-        case 4: return (IMP)ck_h4_iiii;
+        case 4:
+            if (sh.kinds[1] != CKArgID || sh.kinds[2] != CKArgID ||
+                sh.kinds[3] != CKArgID) return NULL;
+            return (IMP)ck_h4_iiii;
         default: return NULL;
     }
 }

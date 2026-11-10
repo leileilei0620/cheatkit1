@@ -297,13 +297,24 @@ static void ck_ex_2ib(id self, SEL _cmd, NSInteger a, BOOL b) {
     ((void (*)(id, SEL, NSInteger, BOOL))s->orig)(self, _cmd, a, b);
 }
 
-static IMP ck_exactTrampoline(const char *enc) {
-    if (!enc || enc[0] != 'v') return NULL;
-    const char *p = enc + 1;
-    if (*p != '@') return NULL; p++;
-    if (*p != ':') return NULL; p++;
+// 跳过紧跟类型码的数字（帧大小 / 栈偏移）。见 AdEngine.m 里 ck_parseShape 的长注释。
+static void ck_ex_skip_digits(const char **pp) {
+    while (**pp >= '0' && **pp <= '9') (*pp)++;
+}
 
-    // 统计参数类型（跳修饰符）
+static IMP ck_exactTrampoline(const char *enc) {
+    if (!enc || (enc[0] != 'v' && enc[0] != 'V')) return NULL;
+    const char *p = enc + 1;
+    // ★ 真实 encoding 是 v24@0:8@16 —— 'v' 后面是帧大小数字，不是 '@'。
+    //   旧版本写 `if (*p != '@') return NULL;` 导致每个方法都返回 NULL，
+    //   规则表一条都装不上（浮窗显示「精确槽 0」）。
+    ck_ex_skip_digits(&p);
+    if (*p != '@') return NULL; p++;
+    ck_ex_skip_digits(&p);
+    if (*p != ':') return NULL; p++;
+    ck_ex_skip_digits(&p);
+
+    // 统计参数类型（跳修饰符 + 偏移数字）
     char types[4] = {0};
     int n = 0;
     while (*p && n < 4) {
@@ -323,6 +334,7 @@ static IMP ck_exactTrampoline(const char *enc) {
             }
             types[n++] = '?';
         } else { types[n++] = '?'; p++; }
+        ck_ex_skip_digits(&p);
     }
 
     if (n == 0) return (IMP)ck_ex_0;
