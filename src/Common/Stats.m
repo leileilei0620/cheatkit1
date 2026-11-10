@@ -6,6 +6,7 @@
 #import "Rewriter.h"
 #import <sys/time.h>
 #import <stdint.h>
+#import <pthread.h>
 
 static int    g_known = 0;
 static int    g_generic = 0;
@@ -39,6 +40,28 @@ void CKStatsSetHookResult(int reward, int play, int fail, int skipped) {
 void CKStatsSetExactSlots(int n) { g_exact = n; }
 
 void CKStatsCountRewardFired(void) { g_rewards++; }
+
+// ---- 补发链诊断 ----
+static int g_scheduleCount = 0;
+static int g_attemptCount  = 0;
+static NSString *g_lastReason = nil;
+static pthread_mutex_t g_reasonLock = PTHREAD_MUTEX_INITIALIZER;
+
+void CKStatsCountSchedule(void) { g_scheduleCount++; }
+void CKStatsCountAttempt(void)  { g_attemptCount++; }
+void CKStatsSetRewardReason(NSString *reason) {
+    pthread_mutex_lock(&g_reasonLock);
+    g_lastReason = reason ? [reason copy] : nil;
+    pthread_mutex_unlock(&g_reasonLock);
+}
+int CKStatsScheduleCount(void) { return g_scheduleCount; }
+int CKStatsAttemptCount(void)  { return g_attemptCount; }
+NSString *CKStatsLastRewardReason(void) {
+    pthread_mutex_lock(&g_reasonLock);
+    NSString *r = g_lastReason ?: @"—";
+    pthread_mutex_unlock(&g_reasonLock);
+    return r;
+}
 
 CKStatsSnapshot CKStatsGet(void) {
     CKStatsSnapshot s;

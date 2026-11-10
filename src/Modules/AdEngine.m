@@ -280,7 +280,13 @@ static BOOL ck_parseShape(const char *enc, CKShape *out) {
 // ★ 为什么必须记：trampoline 是按「参数形状」复用的，同一份 ck_h2_ii
 //   既可能服务奖励回调、也可能服务播放回调。只有 slot 里存了类别，
 //   trampoline 才知道该不该主动补发一次奖励。
-typedef enum { CKSlotOther = 0, CKSlotReward = 1, CKSlotPlay = 2, CKSlotFail = 3 } CKSlotKind;
+typedef enum {
+    CKSlotOther     = 0,
+    CKSlotReward    = 1,   // 奖励/校验回调：只登记 delegate，绝不补发
+    CKSlotPlay      = 2,   // 看完了（playFinish/complete/countdownFinish）：主动补发
+    CKSlotFail      = 3,   // 失败回调：不装 hook（见 ck_hookClass）
+    CKSlotPlayStart = 4    // 开始展示：只记录，不补发（否则没看完就发奖）
+} CKSlotKind;
 
 typedef struct {
     Class      cls;
@@ -350,14 +356,15 @@ static void ck_postAction(id self, SEL sel, id arg) {
     if (d) CKRegisterRewardDelegate(d);
 
     if (slot->kind == CKSlotPlay) {
-        // 播放入口 = 真正的掐表点，主动补发一次。
-        //   ★ 用 self 而不是 arg 当目标：self 一定活着且生命周期跟着这次播放；
-        //     arg 可能是 nil、error 对象、进度数字包装，挂去重标记会挂错地方。
-        //     真正的 delegate 由 CKInvokeDelegateReward 三级回落去找。
-        CKLog(@"[引擎] 播放入口 -%s，排程补发", sel_getName(sel));
+        // ★ 只有「看完了」才补发。这是唯一合法入口。
+        //   用 self 而不是 arg 当目标：self 一定活着且生命周期跟着这次播放；
+        //   arg 可能是 nil、error 对象、进度数字包装，挂去重标记会挂错地方。
+        //   真正的 delegate 由 CKInvokeDelegateReward 三级回落去找。
+        CKLog(@"[引擎] 播完 -%s，排程补发", sel_getName(sel));
         CKTryScheduleReward(self, 1.0);
     }
-    // CKSlotReward：到这里已经登记完 delegate 就够了，绝不二次补发
+    // CKSlotReward：登记完 delegate 就够，绝不二次补发（否则双发→领奖闪退）
+    // CKSlotPlayStart：只登记 delegate，不补发（否则广告一亮就发奖，没看完也发）
 }
 
 static void ck_h0(id self, SEL _cmd) {
@@ -454,28 +461,62 @@ static BOOL ck_selHasAny(const char *sel, const char **kw, size_t n) {
     return NO;
 }
 
-static BOOL ck_isRewardSel(const char *sel) {
-    static const char *kw[] = {
-        // 奖励/校验类
-        "reward", "verify", "verified", "effective", "earn",
-        "convert", "incentive", "success",
-        // 完播类 —— 播放器/倒计时才是真正掐表的地方，
-        // 这些是它们回报「看完了」的入口
-        "didfinish", "playfinish", "complete",
-        "playend", "didend", "watchfinish", "didwatch",
-        "rewardvideoend", "videofinish"
-    };
-    return ck_selHasAny(sel, kw, sizeof(kw)/sizeof(kw[0]));
-}
-static BOOL ck_isPlaySel(const char *sel) {
-    static const char *kw[] = {
-        "show", "present", "render", "expose",
-        "playstart", "didstart", "didplay", "videostart", "countdownstart"
-    };
-    return ck_selHasAny(sel, kw, sizeof(kw)/sizeof(kw[0]));
-}
+// ★★★ 关键词表的三条铁律（踩过坑，别再改回去）★★★
+//
+//  铁律 1：fail 类必须最先判定，且命中后「一个字都不改」。
+//     反例：叫 rewardedVideoAdDidFailWithError: 的方法同时含 "reward"
+//     和 "fail"。如果按 reward 处理，我们会把它第二个参数 (BOOL) 从
+//     NO 改成 YES，SDK 拿到 YES 以为是「发奖成功」，接着去 doting
+//     不存在的数据 → 黑屏 / 崩 / 播不下去。
+//     这就是「有的广告播放失败」的直接原因。
+//
+//  铁律 2："show" / "present" / "render" / "expose" 是「开始展示」，
+//     不是「看完」。把它们当补发点，等于广告一亮就开始发奖，
+//     用户没看完也发，随后 SDK 自己再发一次 → 双发 → 领奖闪退。
+//
+//  铁律 3：只有「播完 / 倒计时结束」才算补发点。
+//     didfinish / playfinish / complete / playend / countdownfinish /
+//     timerfinish —— 这些是真实会发生的、且代表「看完了」的入口。
+
 static BOOL ck_isFailSel(const char *sel) {
-    static const char *kw[] = {"fail", "error", "nofill", "no_fill", "didclose", "skip", "cancel"};
+    static const char *kw[] = {
+        "fail", "error", "nofill", "no_fill", "nosdk", "notfound",
+        "didclose", "didclose", "close", "skip", "cancel",
+        "interrupt", "timeout"
+    };
+    return ck_selHasAny(sel, kw, sizeof(kw)/sizeof(kw[0]));
+}
+
+// 真正会发奖 / 校验发奖的方法（会被改 BOOL 参数）
+static BOOL ck_isRewardSel(const char *sel) {
+    if (ck_isFailSel(sel)) return NO;      // 铁律 1：fail 永不参与
+    static const char *kw[] = {
+        "reward", "verify", "verified", "valid", "effective",
+        "earn", "incentive", "convert"
+    };
+    return ck_selHasAny(sel, kw, sizeof(kw)/sizeof(kw[0]));
+}
+
+// 「看完了」——唯一允许主动补发的入口
+static BOOL ck_isPlayDoneSel(const char *sel) {
+    if (ck_isFailSel(sel)) return NO;      // 铁律 1
+    static const char *kw[] = {
+        "didfinish", "playfinish", "videofinish", "finishplaying",
+        "complete", "playend", "didend", "watchfinish", "didwatch",
+        "countdownfinish", "counttimerfinish", "countdownend",
+        "timerfinish", "timerend", "rewardvideoend"
+    };
+    return ck_selHasAny(sel, kw, sizeof(kw)/sizeof(kw[0]));
+}
+
+// 「开始展示 / 开始播放」——只记录，不补发（铁律 2）
+static BOOL ck_isPlayStartSel(const char *sel) {
+    if (ck_isFailSel(sel)) return NO;      // 铁律 1
+    static const char *kw[] = {
+        "willshow", "didshow", "willpresent", "didpresent",
+        "playstart", "didstart", "didplay", "videostart",
+        "countdownstart", "render", "expose"
+    };
     return ck_selHasAny(sel, kw, sizeof(kw)/sizeof(kw[0]));
 }
 
@@ -716,6 +757,7 @@ BOOL CKInvokeDelegateReward(id adObj) {
             [inv invoke];
             CKLog(@"[补发] 投递 %s -%@ 成功", class_getName([d class]), name);
             CKStatsCountRewardFired();     // 浮窗计数
+            CKStatsSetRewardReason([NSString stringWithFormat:@"成功 %@", name]);
             return YES;
         } @catch (NSException *e) {
             CKLog(@"[补发] %@ 异常: %@", name, e.reason);
@@ -746,6 +788,7 @@ static void ck_scheduleReward(id adObj, double delaySec) {
     }
     objc_setAssociatedObject(adObj, kKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+    CKStatsCountSchedule();
     CKLog(@"[补发] 已排程，%.1f 秒后投递", delaySec);
 
     // ★ 投递必须在主线程。
@@ -766,20 +809,24 @@ static void ck_scheduleReward(id adObj, double delaySec) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @autoreleasepool {
+            CKStatsCountAttempt();
             if (CKInvokeDelegateReward(adObj)) return;
-
+            CKStatsSetRewardReason(@"找不到 delegate");
             CKLog(@"[补发] 第 1 次未找到 delegate，%.0fs 后重试", kRetryDelay[0]);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          (int64_t)(kRetryDelay[0] * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @autoreleasepool {
+                    CKStatsCountAttempt();
                     if (CKInvokeDelegateReward(adObj)) return;
                     CKLog(@"[补发] 第 2 次仍未找到，%.0fs 后最后一次", kRetryDelay[1]);
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                                  (int64_t)(kRetryDelay[1] * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
                         @autoreleasepool {
+                            CKStatsCountAttempt();
                             if (!CKInvokeDelegateReward(adObj)) {
+                                CKStatsSetRewardReason(@"三次均失败");
                                 CKLog(@"[补发] 三次均失败，放弃这一支（delegate 未就绪）");
                             }
                         }
@@ -812,10 +859,21 @@ static void ck_hookClass(Class cls, const char *clsName, CKStat *st) {
         SEL sel = method_getName(list[i]);
         const char *sn = sel_getName(sel);
 
-        BOOL reward = ck_isRewardSel(sn);
-        BOOL play   = ck_isPlaySel(sn);
-        BOOL fail   = ck_isFailSel(sn);
-        if (!reward && !play && !fail) continue;
+        // ★ 四分类，顺序不能变（fail 最先，且命中即跳过）
+        BOOL fail      = ck_isFailSel(sn);
+        BOOL playDone  = ck_isPlayDoneSel(sn);
+        BOOL reward    = ck_isRewardSel(sn);
+        BOOL playStart = ck_isPlayStartSel(sn);
+        if (!fail && !playDone && !reward && !playStart) continue;
+
+        // 失败回调：只统计，一个参数都不改，也不装 hook。
+        //   ★ 这是「有的广告播放失败」的修复点：
+        //     rewardedVideoAdDidFailWithError: 以前被当 reward 处理，
+        //     把 BOOL 从 NO 改成 YES，SDK 以为发奖成功去取数据 → 黑屏/播不动。
+        if (fail && !playDone && !reward && !playStart) {
+            st->fail++;
+            continue;
+        }
 
         const char *enc = method_getTypeEncoding(list[i]);
         CKShape sh;
@@ -841,25 +899,24 @@ static void ck_hookClass(Class cls, const char *clsName, CKStat *st) {
         slot->cls = cls;
         slot->sel = sel;
         slot->orig = orig;
-        // ★ 类别优先级：奖励 > 播放 > 失败。
-        //   同一 SEL 可能同时命中多个关键词（如 rewardedVideoAdDidPlayFinish
-        //   既含 reward 又含 playfinish），但它的真实语义是「播放结束」，
-        //   所以要按 fail > play > reward 的顺序选？—— 不行。
-        //   实测：xxxDidPlayFinish: 这类在 SDK 里是「播放结束」回调，
-        //   是补发的正确触发点；而 xxxDidReward: 是「已发奖」通知。
-        //   两者关键词都会命中 reward（因为带 reward 字样）。
-        //   因此这里用「先判 play 再判 reward」：播放类更早、更可靠。
-        slot->kind = play ? CKSlotPlay : (reward ? CKSlotReward
-                                              : (fail ? CKSlotFail : CKSlotOther));
+        // ★ 类别优先级：播完 > 奖励 > 开始展示。
+        //   「播完」是最可靠的补发点，哪怕方法名里也带 reward 字样
+        //   （rewardedVideoAdDidPlayFinish: 就是这种情况），
+        //   它的真实语义仍然是「播放结束」，必须判成 CKSlotPlay。
+        if (playDone)        slot->kind = CKSlotPlay;
+        else if (reward)     slot->kind = CKSlotReward;
+        else if (playStart)  slot->kind = CKSlotPlayStart;
+        else                 slot->kind = CKSlotOther;
         slot->used = YES;
         pthread_mutex_unlock(&g_slotLock);
 
         method_setImplementation(list[i], tramp);
 
-        if (reward) st->reward++;
-        if (play)   st->play++;
-        if (fail)   st->fail++;
-        CKLog(@"[引擎] hook %s -%s (%d 参)", clsName, sn, sh.argc);
+        if (playDone)  st->play++;
+        if (reward)    st->reward++;
+        if (playStart) st->play++;   // 展示类计入播放统计，浮窗上看得出装了多少
+        CKLog(@"[引擎] hook %s -%s (%d 参, %s)", clsName, sn, sh.argc,
+              playDone ? "播完→补发" : (reward ? "奖励→只登记" : "展示→不补发"));
     }
     free(list);
 }
@@ -917,7 +974,8 @@ void CKDumpAdSDKs(void) {
         Method *ms = class_copyMethodList(classes[i], &mn);
         for (unsigned int j = 0; ms && j < mn; j++) {
             const char *sn = sel_getName(method_getName(ms[j]));
-            if (ck_isRewardSel(sn) || ck_isPlaySel(sn) || ck_isFailSel(sn)) {
+            if (ck_isRewardSel(sn) || ck_isPlayDoneSel(sn) ||
+                ck_isPlayStartSel(sn) || ck_isFailSel(sn)) {
                 CKLog(@"[dump]    - %s  enc=%s", sn, method_getTypeEncoding(ms[j]));
             }
         }

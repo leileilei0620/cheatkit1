@@ -352,6 +352,21 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
         reset.layer.borderColor = [UIColor orangeColor].CGColor;
         reset.layer.cornerRadius = 6;
         [reset addTarget:self action:@selector(doReset) forControlEvents:UIControlEventTouchUpInside];
+
+        // ---- 自检（不用查 Console，点一下把诊断打到浮窗日志区）----
+        y += 40;
+        UIButton *diag = [UIButton buttonWithType:UIButtonTypeSystem];
+        diag.frame = CGRectMake(10, y, innerW, 32);
+        [diag setTitle:@"自检" forState:UIControlStateNormal];
+        [diag setTitleColor:[UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1.0]
+                   forState:UIControlStateNormal];
+        diag.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        diag.layer.borderColor = [UIColor colorWithRed:0.3 green:0.8 blue:0.5 alpha:0.8].CGColor;
+        diag.layer.borderWidth = 1;
+        diag.layer.cornerRadius = 6;
+        [diag addTarget:self action:@selector(doSelfCheck) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:diag];
+        y += 40;
         [_scroll addSubview:reset];
         y += 42;
 
@@ -383,6 +398,43 @@ static UIColor *ck_dim(void)   { return [UIColor colorWithWhite:0.72 alpha:1.0];
     self.hidden = YES;
     // 通知状态面板刷新（顺便让它显示出来）
     [[NSNotificationCenter defaultCenter] postNotificationName:@"CKOverlayShowMain" object:nil];
+}
+
+// ---- 自检：把所有关键诊断一次性打到浮窗日志区 ----
+//   用户不用连 Console，点一下就能看「卡在哪一步」。
+- (void)doSelfCheck {
+    CKStatsSnapshot st = CKStatsGet();
+    NSArray *sdks = CKDetectedSDKs();
+
+    CKLog(@"[自检] ===== CheatKit 自检 =====");
+    CKLog(@"[自检] 进程 %@  运行 %.0fs", CKCurrentBundleID(), st.uptime);
+    CKLog(@"[自检] 广告类 已知%d 兜底%d", st.knownClasses, st.genericClasses);
+    CKLog(@"[自检] hook 奖励%d 播放%d 失败%d 跳过%d 精确槽%d",
+          st.rewardHooks, st.playHooks, st.failHooks, st.skipped, st.exactSlots);
+    CKLog(@"[自检] SDK %@", sdks.count ? [sdks componentsJoinedByString:@","] : @"未识别");
+    CKLog(@"[自检] 补发 排程%d 尝试%d 成功%d 原因:%@",
+          CKStatsScheduleCount(), CKStatsAttemptCount(), st.rewardsFired,
+          CKStatsLastRewardReason());
+    CKLog(@"[自检] 开关 奖励%@ eCPM%@ 指纹%@ 网络%@",
+          CKFeatureGet(CKFeatureRewardForce) ? @"开" : @"关",
+          CKFeatureGet(CKFeatureEcpmTamper) ? @"开" : @"关",
+          CKFeatureGet(CKFeatureFingerprint) ? @"开" : @"关",
+          CKFeatureGet(CKFeatureNetTamper) ? @"开" : @"关");
+
+    // 一句话结论
+    NSString *verdict = nil;
+    if (st.rewardHooks + st.playHooks == 0) {
+        verdict = @"没装上任何广告 hook → 这个 App 用的 SDK 不在指纹表里，或广告还没初始化";
+    } else if (CKStatsScheduleCount() == 0) {
+        verdict = @"hook 装上了但没触发 → 广告还没播，或播完回调名不在关键词表";
+    } else if (CKStatsAttemptCount() == 0) {
+        verdict = @"排程了但定时器没跑 → 主线程被阻塞（检查是否卡在加载）";
+    } else if (st.rewardsFired == 0) {
+        verdict = @"投递了但没成功 → delegate 找不到，把浮窗里的 adObj 类名发我";
+    } else {
+        verdict = @"全链路通了，奖励已发出";
+    }
+    CKLog(@"[自检] 结论：%@", verdict);
 }
 
 - (void)doReset {
@@ -522,7 +574,7 @@ static CKOverlayView   *g_view   = nil;
         [self addSubview:_closeBtn];
 
         // 数据区
-        _bodyLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 26, w - 20, 104)];
+        _bodyLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 26, w - 20, 116)];
         _bodyLabel.numberOfLines = 0;
         _bodyLabel.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
         _bodyLabel.textColor = [UIColor whiteColor];
@@ -661,8 +713,8 @@ static CKOverlayView   *g_view   = nil;
     _gearBtn.frame      = CGRectMake(w - 92, 2, 30, 26);
     _collapseBtn.frame  = CGRectMake(w - 62, 2, 28, 26);
     _closeBtn.frame     = CGRectMake(w - 32, 2, 28, 26);
-    _bodyLabel.frame    = CGRectMake(10, 26, w - 20, 104);
-    _logLabel.frame     = CGRectMake(10, 134, w - 20, h - 140);
+    _bodyLabel.frame    = CGRectMake(10, 26, w - 20, 116);
+    _logLabel.frame     = CGRectMake(10, 146, w - 20, h - 152);
 }
 
 // ---- 每秒刷新 ----
@@ -687,6 +739,13 @@ static CKOverlayView   *g_view   = nil;
     [b appendFormat:@"hook 奖%d 播%d 失%d 跳%d\n",
         s.rewardHooks, s.playHooks, s.failHooks, s.skipped];
     [b appendFormat:@"eCPM %d 次   发奖 %d 次\n", s.ecpmHits, s.rewardsFired];
+    // ★ 补发诊断行：不查 Console 也能看出卡在哪一步
+    //   schedule/attempt/fired：排程了几次 / 尝试投递几次 / 成功几次
+    //   三个数一起看就能定位：排程 0 → 播完回调没抓到；
+    //   排程>0 但 attempt 0 → 定时器没跑；attempt>0 但 fired 0 → 找不到 delegate
+    [b appendFormat:@"补发 排%d 试%d 成%d  %@\n",
+        CKStatsScheduleCount(), CKStatsAttemptCount(), s.rewardsFired,
+        CKStatsLastRewardReason()];
 #if ENABLE_AUTOPILOT
     [b appendFormat:@"%@\n", CKAPStatusLine()];
 #endif
@@ -694,7 +753,8 @@ static CKOverlayView   *g_view   = nil;
 
     _bodyLabel.text = b;
 
-    NSArray<NSString *> *logs = CKRecentLogs(5);
+    // 9 条：自检一次会打 8 行，要能一口气看全
+    NSArray<NSString *> *logs = CKRecentLogs(9);
     if (logs.count) _logLabel.text = [logs componentsJoinedByString:@"\n"];
 }
 

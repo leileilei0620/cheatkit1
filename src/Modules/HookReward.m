@@ -196,6 +196,9 @@ static void ck_ex_1(id self, SEL _cmd, id a) {
 static void ck_ex_1b(id self, SEL _cmd, BOOL b) {
     CKExactSlot *s = ck_findExact(self, _cmd);
     if (!s) return;
+    if (s->kind == CKKindPlay && ck_rewardForceOn()) {
+        CKTryScheduleReward(self, 1.0);
+    }
     if (ck_rewardForceOn() && !b) {
         CKLog(@"[精确] -%s verify NO -> YES", sel_getName(_cmd));
         b = YES;
@@ -206,6 +209,13 @@ static void ck_ex_1b(id self, SEL _cmd, BOOL b) {
 static void ck_ex_2(id self, SEL _cmd, id a, id b) {
     CKExactSlot *s = ck_findExact(self, _cmd);
     if (!s) return;
+    // ★ CKKindPlay 必须在 orig 之前补发（两参形状也要处理）。
+    //   漏了这一段的话，所有「2 参的播放结束回调」都不会补发，
+    //   表现就是「有的软件看完没奖励」——因为它走的正是两参形状。
+    if (s->kind == CKKindPlay && ck_rewardForceOn()) {
+        CKLog(@"[精确] 播完 -%s，排程补发", sel_getName(_cmd));
+        CKTryScheduleReward(self, 1.0);
+    }
     if (s->kind == CKKindReward && ck_rewardForceOn()) {
         // ★ 这里刻意「只登记、不补发」。
         //   原实现在奖励回调里又调 CKTryScheduleReward 投递一次，
@@ -237,6 +247,10 @@ static void ck_ex_2b(id self, SEL _cmd, id a, BOOL b) {
 static void ck_ex_2ib(id self, SEL _cmd, NSInteger a, BOOL b) {
     CKExactSlot *s = ck_findExact(self, _cmd);
     if (!s) return;
+    if (s->kind == CKKindPlay && ck_rewardForceOn()) {
+        CKLog(@"[精确] 播完 -%s，排程补发", sel_getName(_cmd));
+        CKTryScheduleReward(self, 1.0);
+    }
     if (ck_rewardForceOn()) b = YES;
     ((void (*)(id, SEL, NSInteger, BOOL))s->orig)(self, _cmd, a, b);
 }

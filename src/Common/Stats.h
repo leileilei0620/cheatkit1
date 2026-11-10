@@ -42,4 +42,16 @@ void CKStatsSetExactSlots(int n);
 void CKStatsCountRewardFired(void);
 CKStatsSnapshot CKStatsGet(void);
 
+// ---- 补发链诊断（浮窗「补发 排/试/成」那一行） ----
+//   schedule：ck_scheduleReward 被调用几次（= 抓到几次播完回调）
+//   attempt ：真正执行投递几次（= 定时器跑起来几次）
+//   reason   ：最后一次失败的原因，成功则是「成功」
+// 这三个数组合起来能直接定位断点，不用翻 Console。
+void   CKStatsCountSchedule(void);
+void   CKStatsCountAttempt(void);
+void   CKStatsSetRewardReason(NSString *reason);
+int    CKStatsScheduleCount(void);
+int    CKStatsAttemptCount(void);
+NSString *CKStatsLastRewardReason(void);
+
 #endif
