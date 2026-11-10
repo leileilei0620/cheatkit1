@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 越狱环境下加载 dylib 需要这几个权限 -->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.container-required</key>
+	<false/>
+	<!-- 跨进程注入 / 遍历其他 App 需要的 -->
+	<key>com.apple.private.skip-library-validation</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+	<!-- 读机器信息做指纹用的 -->
+	<key>com.apple.private.accounts.allaccounts</key>
+	<true/>
+</dict>
+</plist>
