@@ -45,7 +45,7 @@
 //       并替换实现。会命中 Security / CFNetwork / WebKit 内部类，
 //       已证实导致 SIGBUS（KERN_PROTECTION_FAILURE，SecTrust 被并发重复评估）。
 //   0 = 只处理本 App 与 Frameworks 目录下的类（游戏自己的 delegate），安全。
-#define ENABLE_NET_SESSION_HOOK_SAFE   1   // 安全版：只 hook 非系统类（推荐）
+#define ENABLE_NET_SESSION_HOOK_SAFE   0   // 安全版：只 hook 非系统类（默认关，见 HookNet.m 注释）
 #define ENABLE_NET_SESSION_HOOK_ALL    0   // 全量版：连系统类一起 hook（会崩，别开）
 
 // ENABLE_NET_TRUST_HOOK

@@ -15,6 +15,7 @@
 #import <dlfcn.h>
 #import <string.h>
 #import <stdlib.h>
+#import <pthread.h>       // CKNetSlot 槽表加锁
 #import "../vendor/ck_compat.h"
 
 // ============================================================
@@ -50,29 +51,118 @@ static bool ck_SecTrustEvaluateWithError(SecTrustRef trust, CFErrorRef *error) {
 }
 
 // ---- A2: NSURLSession delegate ----
-// 注意：不能覆盖所有 delegate 的同一个 IMP，否则链式调用会串。
-// 这里按“首次遇到的 delegate 实现”为 orig，其余类直接放行。
+//
+// ★ 这个函数曾经把 App 点崩（EXC_CRASH / SIGABRT）：
+//     0 CoreFoundation  __exceptionPreprocess
+//     1 libobjc         objc_exception_throw
+//     2 CoreFoundation  +[NSObject(NSObject) _copyDescription]
+//     3 CoreFoundation  ___forwarding___
+//     4 CoreFoundation  _CF_forwarding_prep_0
+//     5 CheatKit.dylib  ck_didReceiveChallenge
+//   原因：同一个 IMP 被挂到多个类上，某些类的方法签名里
+//   challenge / completion 的真实类型与我们假设的不一致
+//   （KVO 动态子类、AFNetworking 的包装类、广告 SDK 自建 delegate），
+//   一取属性就触发 unrecognized selector。
+//
+//   加固措施（三层）：
+//     1. 每个类单独记 orig，不在挑战是 serverTrust 时调用它 —— 保持原行为
+//     2. 取 challenge / completion 之前做 isKindOfClass 与空判
+//     3. 签名对不上（参数个数/类型不同）的类直接跳过不 hook
 typedef void (*DidReceiveChallenge_t)(id, SEL, NSURLSession *, NSURLSessionTask *,
                                       NSURLAuthenticationChallenge *,
                                       void (^)(NSURLSessionAuthChallengeDisposition,
                                                NSURLCredential *));
-static DidReceiveChallenge_t orig_didReceiveChallenge = NULL;
+
+#define CK_NET_SLOTS 128
+typedef struct { Class cls; DidReceiveChallenge_t orig; } CKNetSlot;
+static CKNetSlot g_netSlots[CK_NET_SLOTS];
+static int g_netSlotCount = 0;
+static pthread_mutex_t g_netLock = PTHREAD_MUTEX_INITIALIZER;
+
+static DidReceiveChallenge_t ck_netOrigFor(id self) {
+    if (!self) return NULL;
+    Class c = object_getClass(self);
+    for (;;) {
+        pthread_mutex_lock(&g_netLock);
+        for (int i = 0; i < g_netSlotCount; i++) {
+            if (g_netSlots[i].cls == c) {
+                DidReceiveChallenge_t o = g_netSlots[i].orig;
+                pthread_mutex_unlock(&g_netLock);
+                return o;
+            }
+        }
+        pthread_mutex_unlock(&g_netLock);
+        c = class_getSuperclass(c);
+        if (!c) break;
+    }
+    return NULL;
+}
+
+static void ck_netRecord(Class cls, DidReceiveChallenge_t orig) {
+    pthread_mutex_lock(&g_netLock);
+    if (g_netSlotCount < CK_NET_SLOTS) {
+        g_netSlots[g_netSlotCount].cls  = cls;
+        g_netSlots[g_netSlotCount].orig = orig;
+        g_netSlotCount++;
+    }
+    pthread_mutex_unlock(&g_netLock);
+}
 
 static void ck_didReceiveChallenge(id self, SEL _cmd, NSURLSession *session,
                                    NSURLSessionTask *task,
                                    NSURLAuthenticationChallenge *challenge,
                                    void (^completion)(NSURLSessionAuthChallengeDisposition,
                                                       NSURLCredential *)) {
-    NSString *method = challenge.protectionSpace.authenticationMethod;
-    if ([method isEqualToString:NSURLAuthenticationMethodServerTrust] && ck_netOn()) {
-        NSURLCredential *cred = [NSURLCredential credentialForTrust:
-                                 challenge.protectionSpace.serverTrust];
-        CKLog(@"[pin] 放行 serverTrust: %@", challenge.protectionSpace.host);
-        completion(NSURLSessionAuthChallengeUseCredential, cred);
-        return;
+    DidReceiveChallenge_t orig = ck_netOrigFor(self);
+
+    // ★★ 最后一道防线：整个过程包 @try。
+    //   这个函数跑在 CFNetwork 的后台 NSOperationQueue 上，
+    //   ObjC 异常在这里没人捕获 → std::terminate → abort →
+    //   EXC_CRASH / SIGABRT（实测崩溃就是这个：
+    //     __exceptionPreprocess → objc_exception_throw →
+    //     +[NSObject _copyDescription] → ___forwarding___ →
+    //     _CF_forwarding_prep_0 → ck_didReceiveChallenge）。
+    //   宁可放弃这一次放行，也不能把整个 App 带走。
+    @try {
+        // 第一道防线：不是预期的类型，直接交还原实现，绝不自己编 completion
+        if (!completion || !challenge ||
+            ![challenge isKindOfClass:[NSURLAuthenticationChallenge class]]) {
+            if (orig) orig(self, _cmd, session, task, challenge, completion);
+            return;
+        }
+
+        // 只在 serverTrust + 开关打开 且 challenge 结构可信时才放行
+        if (ck_netOn() && [challenge respondsToSelector:@selector(protectionSpace)]) {
+            NSURLProtectionSpace *ps = challenge.protectionSpace;
+            if ([ps isKindOfClass:[NSURLProtectionSpace class]] &&
+                [ps.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust] &&
+                ps.serverTrust) {
+                NSURLCredential *cred = [NSURLCredential credentialForTrust:ps.serverTrust];
+                if (cred) {
+                    CKLog(@"[pin] 放行 serverTrust: %@", ps.host ?: @"?");
+                    completion(NSURLSessionAuthChallengeUseCredential, cred);
+                    return;
+                }
+            }
+        }
+
+        // 其余情况（Basic/Digest/ClientCertificate，或开关关着）全部交还原实现
+        if (orig) {
+            orig(self, _cmd, session, task, challenge, completion);
+        } else {
+            completion(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+        }
     }
-    // 开关关掉时也走这里 → 系统默认校验（pinning 生效）
-    completion(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+    @catch (NSException *e) {
+        CKLog(@"[pin] didReceiveChallenge 异常已吞掉（%s: %s），回落默认处理",
+              e.name.UTF8String ?: "?", e.reason.UTF8String ?: "?");
+        if (orig) {
+            @try { orig(self, _cmd, session, task, challenge, completion); }
+            @catch (NSException *e2) { (void)e2; }
+        } else if (completion) {
+            completion(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+        }
+    }
 }
 
 static void ck_install_session_delegate_hook(void) {
@@ -95,15 +185,45 @@ static void ck_install_session_delegate_hook(void) {
     //   所以默认只接管「本 App + 本 App 的 Frameworks」里的类。
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
 
-    int hooked = 0, skipped = 0;
+    int hooked = 0, skipped = 0, badsig = 0;
     for (unsigned int i = 0; i < classCount; i++) {
         Class cls = classes[i];
+
+        // ★★ 必须只处理「自己实现了这个方法」的类。
+        //   class_getInstanceMethod 会沿父类链查找：如果 A 没实现、
+        //   父类 B 实现了，它返回的是 B 的 Method，method_setImplementation
+        //   改的就成了 B —— 所有 B 的子类一起中招，签名还未必一致，
+        //   于是 _CF_forwarding_prep_0 / unrecognized selector 崩溃。
+        //   实测栈：objc_exception_throw ← _copyDescription ← ___forwarding___
+        //           ← ck_didReceiveChallenge
+        unsigned int ownCount = 0;
+        Method *ownList = class_copyMethodList(cls, &ownCount);
+        BOOL implementedHere = NO;
+        if (ownList) {
+            for (unsigned int k = 0; k < ownCount; k++) {
+                if (method_getName(ownList[k]) == sel) { implementedHere = YES; break; }
+            }
+            free(ownList);
+        }
+        if (!implementedHere) continue;
+
         Method m = class_getInstanceMethod(cls, sel);
         if (!m) continue;
         if (method_getImplementation(m) == (IMP)ck_didReceiveChallenge) continue;
 
+        // ★ 签名校验：数清参数个数，别去硬匹配 encoding 字符串
+        //   （不同 SDK/编译器产出的偏移写法不一致，硬匹配会误杀正常类）
+        //   self + _cmd + session + task + challenge + completion = 6 个
+        NSMethodSignature *sig = [cls instanceMethodSignatureForSelector:sel];
+        if (!sig || sig.numberOfArguments != 6) { badsig++; continue; }
+        // 返回类型必须是 void
+        const char *rt = [sig methodReturnType];
+        if (!rt || rt[0] != 'v') { badsig++; continue; }
+
 #if ENABLE_NET_SESSION_HOOK_ALL
         // 全量模式：连系统类一起换（仅供调试，会崩）
+        DidReceiveChallenge_t prev = (DidReceiveChallenge_t)method_getImplementation(m);
+        ck_netRecord(cls, prev);
         method_setImplementation(m, (IMP)ck_didReceiveChallenge);
         hooked++;
 #else
@@ -115,12 +235,17 @@ static void ck_install_session_delegate_hook(void) {
             if (p && [p hasPrefix:bundlePath]) own = YES;
         }
         if (!own) { skipped++; continue; }
+
+        // ★ 记下这个类自己的原实现，trampoline 里按 self 精确找回
+        DidReceiveChallenge_t prev = (DidReceiveChallenge_t)method_getImplementation(m);
+        ck_netRecord(cls, prev);
         method_setImplementation(m, (IMP)ck_didReceiveChallenge);
         hooked++;
 #endif
     }
     free(classes);
-    CKLog(@"[pin] URLSession delegate hook: %d 个（跳过系统类 %d）", hooked, skipped);
+    CKLog(@"[pin] URLSession delegate hook: %d 个（跳过系统类 %d / 签名不符 %d）",
+          hooked, skipped, badsig);
 #endif
 }
 
