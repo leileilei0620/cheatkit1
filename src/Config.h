@@ -39,6 +39,28 @@
 #define ENABLE_SDK_SCAN          0   // 启动时 dump 所有广告相关类（调试用，正式版关）
 #define ENABLE_OVERLAY           1   // 进程内悬浮窗：实时显示注入/hook/改写状态
 
+// ---- 危险 hook 分级（★ 默认全关，闪退就是它们引起的）-------------------
+// ENABLE_NET_SESSION_HOOK
+//   1 = 按 SEL 扫全进程所有类的 -URLSession:didReceiveChallenge:completionHandler:
+//       并替换实现。会命中 Security / CFNetwork / WebKit 内部类，
+//       已证实导致 SIGBUS（KERN_PROTECTION_FAILURE，SecTrust 被并发重复评估）。
+//   0 = 只处理本 App 与 Frameworks 目录下的类（游戏自己的 delegate），安全。
+#define ENABLE_NET_SESSION_HOOK_SAFE   1   // 安全版：只 hook 非系统类（推荐）
+#define ENABLE_NET_SESSION_HOOK_ALL    0   // 全量版：连系统类一起 hook（会崩，别开）
+
+// ENABLE_NET_TRUST_HOOK
+//   1 = inline hook SecTrustEvaluate / SecTrustEvaluateWithError。
+//       需要 Substrate/ElleKit；裸注入下自动跳过。手机会常驻 TLS 握手线程，
+//       在线程正执行该函数时打补丁 = 半条指令 → 跳到野地址，风险高。
+#define ENABLE_NET_TRUST_HOOK          0
+
+// ENABLE_DYLD_INFOARRAY_PATCH
+//   1 = mprotect 改 dyld_all_image_infos->infoArray（结构体层摘除镜像）。
+//       __DATA_CONST 页受 codesign 保护，mprotect 常失败；即便成功，
+//       dyld 内部与 CrashReporter 遍历该数组时会读到已换掉的指针 → SIGBUS。
+//   0 = 只用 _dyld_image_count / _dyld_get_image_name 函数层隐藏（安全）。
+#define ENABLE_DYLD_INFOARRAY_PATCH    0
+
 // ============================================================
 // 3. SDK 覆盖（通用引擎会自己探测，这里是精细 hook 的开关）
 // ============================================================

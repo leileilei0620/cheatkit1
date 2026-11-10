@@ -16,6 +16,7 @@
 #import <stdint.h>   // int64_t（dispatch_time 参数）
 #import <unistd.h>   // getpid
 #import <UIKit/UIKit.h>
+#import <dlfcn.h>              // dlsym（单实例检测）
 #import <dispatch/dispatch.h>   // dispatch_after / dispatch_get_main_queue 显式声明，
                                 // 不依赖 Foundation 的间接包含链（Linux 交叉编译更稳）
 
@@ -88,10 +89,36 @@ static void ck_bootstrap_system(void) {
 //   （trampoline 套 trampoline），轻则数字翻倍，重则闪退。
 static BOOL g_bootstrapped = NO;
 
+// ★ 为什么不在主线程装 hook：
+//   整套模块要遍历全进程类表（objc_copyClassList）几千个类，
+//   逐个 class_getInstanceMethod / method_setImplementation。
+//   这些都会拿 objc runtime 的全局锁，而广告 SDK / 游戏引擎的
+//   网络、渲染线程此时正在疯狂查方法（objc_msgSend 的慢路径）。
+//   主线程同步扫几分钟级别的类表 → 主线程卡死 + 与其它线程抢锁，
+//   实测崩溃栈就是主线程卡在 class_getInstanceMethod，
+//   另一条 CFNetwork 线程在同一时刻踩到保护页。
+//
+//   做法：丢到独立串行队列去装，主线程立刻返回继续跑 UI。
+//   各模块内部需要主线程的部分（Overlay）自己会 dispatch 回主线程。
+static dispatch_queue_t ck_bootstrap_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.cheatkit.bootstrap", DISPATCH_QUEUE_SERIAL);
+        // 降低优先级：不要和游戏渲染/音频线程抢 CPU
+        dispatch_set_target_queue(q, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    });
+    return q;
+}
+
 static void ck_bootstrap_once(void) {
     if (g_bootstrapped) return;
     g_bootstrapped = YES;
-    ck_bootstrap_target_app();
+    dispatch_async(ck_bootstrap_queue(), ^{
+        @autoreleasepool {
+            ck_bootstrap_target_app();
+        }
+    });
 }
 
 static void ck_schedule_bootstrap(void) {
@@ -115,10 +142,42 @@ static void ck_schedule_bootstrap(void) {
 // ============================================================
 //  入口：进程加载 dylib 时自动执行
 // ============================================================
+// ============================================================
+//  单实例保护（★ 极重要）
+//
+//  同一个 App 里可能被注入两份同名 dylib（例如 TrollFools 里
+//  重复添加，镜像名会变成 "CheatKit (1).dylib"）。
+//  两份 constructor 都会跑，于是：
+//    · 全进程 objc_copyClassList 扫描 × 2
+//    · method_setImplementation 对同一批 Method 写两次
+//    · trampoline 套 trampoline，orig 指回自己的 hook
+//    · objc runtime 内部 method list / cache 被并发改写
+//  实测崩溃栈：主线程 class_getInstanceMethod（正在装 hook），
+//  另一线程在 libdispatch __DATA_DIRTY 上 KERN_PROTECTION_FAILURE。
+//
+//  做法：在自己镜像里放一个全局符号，第二次加载时 dlsym 能查到它，
+//  直接 return，不装任何 hook。
+// ============================================================
+int g_cheatkit_instance_guard = 1;
+
+static BOOL ck_is_duplicate_instance(void) {
+    void *self_symbol = dlsym(RTLD_DEFAULT, "g_cheatkit_instance_guard");
+    void *my_symbol = (void *)&g_cheatkit_instance_guard;
+    if (!self_symbol) return NO;
+    // 同名符号解析到别处 → 说明已有一份实例先加载了
+    return (self_symbol != my_symbol);
+}
+
 __attribute__((constructor))
 static void CheatKitInit(void) {
     @autoreleasepool {
         NSString *bid = CKCurrentBundleID();
+
+        if (ck_is_duplicate_instance()) {
+            CKLog(@"[注入] 检测到重复实例（同名 dylib 被注入多次），本次跳过。"
+                  @"请到注入工具里删掉多余的 CheatKit 副本（镜像名带 (1) 的那个）");
+            return;
+        }
 
         // ★ 第一行日志必须在这里打：证明 dylib 真的被注入进来了。
         //   后面的所有判断（系统进程 / 敏感 App / 延迟启动）都可能 return，

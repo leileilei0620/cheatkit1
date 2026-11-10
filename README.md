@@ -271,6 +271,87 @@ eCPM 下限        28       [==|-------]
 
 ---
 
+## 七点五、闪退排查看这里（实战验证过的三个真坑）
+
+下面三条都是**真实崩溃日志**定位出来的，不是猜的。如果你的 dylib 注入后闪退，先对号入座。
+
+### 坑 1：同名 dylib 被注入了两份（最常见）
+
+**症状**：一启动就闪退，日志里镜像名是 `CheatKit (1).dylib`。
+
+**原因**：TrollFools 之类的工具里对同一个 App 重复「注入」，会在 `Frameworks/` 下留两份：
+```
+idiom.app/Frameworks/CheatKit.dylib
+idiom.app/Frameworks/CheatKit (1).dylib     ← 多出来的
+```
+两份 `constructor` 都会跑，于是所有 hook 装两遍、`objc_copyClassList` 扫两遍、
+`method_setImplementation` 对同一批 Method 写两次。objc runtime 的 method cache
+被并发改写 → `EXC_BAD_ACCESS` / `SIGBUS` / `KERN_PROTECTION_FAILURE`。
+
+**修**：注入工具里删掉带 `(1)` 的那份，只留一个。
+代码里也加了单实例保护（`g_cheatkit_instance_guard` 符号探测），
+第二份会打日志直接退出，不会再动手。**但仍然建议手动删干净**。
+
+### 坑 2：全进程替换 URLSession delegate（会崩）
+
+**症状**：启动几秒后闪退，触发线程是 `com.apple.CFNetwork.Connection`。
+
+**原因**：老版本按 SEL 扫**整个进程**所有类的
+`-URLSession:didReceiveChallenge:completionHandler:` 并统一替换实现。
+Security.framework、CFNetwork、WebKit 内部都实现了这个方法，
+替换后 `SecTrust` 被并发重复评估 →
+```
+Security  __SecTrustEvaluateFastAsync_block_invoke
+Security  __handle_trust_evaluate_xpc_async_block_invoke_2
+```
+主线程同时卡在 `class_getInstanceMethod`，两件事撞一起。
+
+**修**：新增两个开关，默认走安全版：
+```c
+#define ENABLE_NET_SESSION_HOOK_SAFE   1   // 只 hook 本 App 镜像里的类（默认）
+#define ENABLE_NET_SESSION_HOOK_ALL    0   // 连系统类一起 hook（会崩，别开）
+```
+安全版用 `class_getImageName(cls)` 和 `[NSBundle mainBundle].bundlePath` 比对前缀，
+只接管 App 自己的 delegate。游戏自带的 pinning 校验类通常在 App 主二进制里，照样能绕过。
+
+### 坑 3：mprotect 改 dyld_all_image_infos（SIGBUS）
+
+**症状**：闪退地址落在 `__DATA_DIRTY` 且属于某个系统库，比如
+```
+0x1ec1479fc is in ...__DATA_DIRTY... SM=COW ...ispatch.dylib
+```
+
+**原因**：`dyld_all_image_infos` 在 `__DATA_CONST`，受 codesign 保护。
+`mprotect` 经常返回 EACCES；就算成功，把 `infoArray` 换成自己的 malloc 数组后，
+dyld 自身和 CrashReporter 遍历该数组时会摸到已失效的指针 → SIGBUS。
+
+**修**：新增开关，默认关闭结构体层：
+```c
+#define ENABLE_DYLD_INFOARRAY_PATCH    0   // 只用函数层隐藏（默认，安全）
+```
+关掉后仍保留 `_dyld_image_count` / `_dyld_get_image_name` 的 Hook，
+绝大多数越狱检测走的是这两个函数，够用。
+
+### 顺带修的两件
+
+- **bootstrap 移出主线程**：整套模块要遍历几千个类并逐个 `method_setImplementation`，
+  全都拿 objc runtime 全局锁。原来跑在主线程 → 卡死 + 撞车。现在丢到
+  `com.cheatkit.bootstrap` 串行队列（`QOS_CLASS_UTILITY` 优先级）。
+- **SecTrust inline hook 默认关闭**（`ENABLE_NET_TRUST_HOOK 0`）：inline hook 打补丁
+  那一瞬如果系统 TLS 线程正在执行该函数，会跳到半条指令上。需要时再手动开。
+
+### 排查顺序
+
+1. 看镜像名有没有 `(1)` → 有就先删
+2. 看 `exception.type` 是 `EXC_BAD_ACCESS` 还是 `EXC_CRASH`
+   - `EXC_CRASH` + `_dyld_missing_symbol_abort` → 是 Substrate 符号残留，更新到 SubstrateRT 版
+   - `EXC_BAD_ACCESS` + `SIGBUS` → 对号入座上面坑 1/2/3
+3. 看 `faultingThread` 的 `queue` 名字，能直接指出是哪条线程出的事
+4. 把 `ENABLE_ANTI_JAILBREAK`、`ENABLE_DYLD_HIDE`、`ENABLE_NET_TAMPER` 全设 0 再跑一遍，
+   能起来就逐个打开定位
+
+---
+
 ## 八、FAQ
 
 **装完没反应 / 没浮窗**

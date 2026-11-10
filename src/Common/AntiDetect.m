@@ -6,6 +6,7 @@
 #import "AntiDetect.h"
 #import "Log.h"
 #import "FeatureFlags.h"          // 运行时开关（越狱绕过/反调试/dyld 隐藏各自独立）
+#import "../Config.h"            // ENABLE_DYLD_INFOARRAY_PATCH 等编译期闸门
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import "SubstrateRT.h"          // 运行时解析，不产生 MS* 符号依赖（裸注入不崩）
@@ -398,6 +399,14 @@ static ck_dyld_info_t *ck_get_all_image_infos(void) {
 
     if (!info->infoArray || info->infoArrayCount == 0) return info;
 
+#if !ENABLE_DYLD_INFOARRAY_PATCH
+    // ★ 默认不做结构体层改写。
+    //   dyld_all_image_infos 位于 __DATA_CONST，受 codesign 保护；
+    //   mprotect 常失败，失败后写入 → SIGBUS。即便 mprotect 成功，
+    //   dyld 自身与 CrashReporter 遍历 infoArray 时会摸到已换掉的指针，
+    //   同样 SIGBUS/SIGSEGV。只保留函数层隐藏已足够骗过绝大多数检测。
+    return info;
+#else
     static dispatch_once_t once2;
     dispatch_once(&once2, ^{
         uint32_t n = info->infoArrayCount;
@@ -435,6 +444,7 @@ static ck_dyld_info_t *ck_get_all_image_infos(void) {
         CKLog(@"[dyld] infoArray 重建: %u -> %u", n, j);
     });
     return info;
+#endif
 }
 
 // ============================================================

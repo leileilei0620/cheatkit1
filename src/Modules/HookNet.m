@@ -76,30 +76,73 @@ static void ck_didReceiveChallenge(id self, SEL _cmd, NSURLSession *session,
 }
 
 static void ck_install_session_delegate_hook(void) {
+#if !ENABLE_NET_SESSION_HOOK_SAFE && !ENABLE_NET_SESSION_HOOK_ALL
+    CKLog(@"[pin] URLSession delegate hook 全部关闭");
+    return;
+#else
     SEL sel = @selector(URLSession:didReceiveChallenge:completionHandler:);
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
     if (!classes) return;
 
-    int hooked = 0;
+    // ★ 为什么不能无差别 hook 全进程：
+    //   这个 SEL 不只广告 SDK 实现，Security.framework / CFNetwork / WebKit /
+    //   各种网络库的私有类都实现了它。把它们全部替换成同一个 IMP 后，
+    //   SecTrust 会被并发重复评估 —— 实测崩溃栈就是
+    //     getMethodNoSuper_nolock → class_getInstanceMethod
+    //   与 CFNetwork 线程里的 __SecTrustEvaluateFastAsync_block_invoke 撞车，
+    //   EXC_BAD_ACCESS / SIGBUS / KERN_PROTECTION_FAILURE。
+    //   所以默认只接管「本 App + 本 App 的 Frameworks」里的类。
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+
+    int hooked = 0, skipped = 0;
     for (unsigned int i = 0; i < classCount; i++) {
-        Method m = class_getInstanceMethod(classes[i], sel);
+        Class cls = classes[i];
+        Method m = class_getInstanceMethod(cls, sel);
         if (!m) continue;
         if (method_getImplementation(m) == (IMP)ck_didReceiveChallenge) continue;
+
+#if ENABLE_NET_SESSION_HOOK_ALL
+        // 全量模式：连系统类一起换（仅供调试，会崩）
         method_setImplementation(m, (IMP)ck_didReceiveChallenge);
         hooked++;
+#else
+        // 安全模式：只碰 App 自己镜像里的类
+        const char *imageName = class_getImageName(cls);
+        BOOL own = NO;
+        if (imageName && bundlePath) {
+            NSString *p = [NSString stringWithUTF8String:imageName];
+            if (p && [p hasPrefix:bundlePath]) own = YES;
+        }
+        if (!own) { skipped++; continue; }
+        method_setImplementation(m, (IMP)ck_didReceiveChallenge);
+        hooked++;
+#endif
     }
     free(classes);
-    CKLog(@"[pin] URLSession delegate hook: %d 个", hooked);
+    CKLog(@"[pin] URLSession delegate hook: %d 个（跳过系统类 %d）", hooked, skipped);
+#endif
 }
 
 // ---- A3: 自定义 TrustManager（只探测，打印供人工确认） ----
 static void ck_install_custom_trust_hook(void) {
+    // ★ 同样只扫 App 自身镜像：
+    //   对全进程数千个类调 class_getInstanceMethod / 列方法，
+    //   等于在高频线程活跃时反复进 objc runtime 锁，得不偿失。
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     unsigned int classCount = 0;
     Class *classes = objc_copyClassList(&classCount);
     if (!classes) return;
+
+    int found = 0;
     for (unsigned int i = 0; i < classCount; i++) {
-        const char *name = class_getName(classes[i]);
+        Class cls = classes[i];
+        const char *imageName = class_getImageName(cls);
+        if (!imageName || !bundlePath) continue;
+        NSString *p = [NSString stringWithUTF8String:imageName];
+        if (!p || ![p hasPrefix:bundlePath]) continue;
+
+        const char *name = class_getName(cls);
         if (!name) continue;
         if (ck_strcasestr(name, "TrustManager") || ck_strcasestr(name, "Pinning") ||
             ck_strcasestr(name, "SSLHelper") || ck_strcasestr(name, "CertificatePinner")) {
@@ -107,9 +150,11 @@ static void ck_install_custom_trust_hook(void) {
             for (NSString *s in CKListMethods(name, NO)) {
                 CKLog(@"[pin]    - %@", s);
             }
+            found++;
         }
     }
     free(classes);
+    CKLog(@"[pin] 自定义校验类扫描完成: %d 个", found);
 }
 
 // ============================================================
@@ -150,9 +195,10 @@ static void ck_dataCompletion(id self, SEL _cmd, NSData *data,
 // ============================================================
 void CKInstallNetHooks(void) {
 #if ENABLE_NET_TAMPER
+#if ENABLE_NET_TRUST_HOOK
     // A1 —— SecTrust 层（最底层，覆盖 NSURLSession / CFNetwork / AFNetworking）
-    // ★ 用 CKInlineHook：没 Substrate 时返回 NO 并留 NULL，
-    //   下面各层 hook 仍会照常装，只是 SecTrust 这一层不生效
+    // ★ 默认关闭：inline hook 有「打补丁瞬间线程正在执行」的窗口，
+    //   系统 TLS 握手线程常驻，撞上就是野跳转。需要时再手动开。
     void *h1 = dlsym(RTLD_DEFAULT, "SecTrustEvaluate");
     if (h1 && !CKInlineHook(h1, (void *)ck_SecTrustEvaluate,
                             (void **)&orig_SecTrustEvaluate)) {
@@ -166,6 +212,9 @@ void CKInstallNetHooks(void) {
         orig_SecTrustEvaluateWithError = NULL;
         CKLog(@"[net] SecTrustEvaluateWithError 跳过（无 Substrate）");
     }
+#else
+    CKLog(@"[net] SecTrust inline hook 未启用（ENABLE_NET_TRUST_HOOK=0）");
+#endif
 
     // A2 / A3
     ck_install_session_delegate_hook();
