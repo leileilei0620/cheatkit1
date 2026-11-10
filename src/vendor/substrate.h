@@ -1,49 +1,32 @@
 //
-//  vendor/substrate.h —— 最小 Substrate / ElleKit 兼容声明
+//  vendor/substrate.h —— 【已废弃】仅作说明，不再声明任何函数
 //
-//  为什么自带这份头文件：
-//    1. Theos 的 iPhoneOS SDK 里没有 substrate.h，GitHub Actions 上编译会直接报
-//       'substrate.h' file not found
-//    2. 我们不想在 CI 里额外下载 libsubstrate.dylib 去链接
+//  ★ 为什么清空：
+//    以前这里声明了 MSHookFunction / MSHookMessageEx 等函数原型，配合
+//    build_dylib.sh 的 -undefined dynamic_lookup，任何【直接调用】都会在
+//    二进制里留下未定义符号 _MSHookFunction。
 //
-//  做法：
-//    - 编译期只声明原型，配合 -undefined dynamic_lookup，链接阶段不要求符号存在
-//    - 运行期由越狱环境的 Substrate / ElleKit 提供实现
-//      （Dopamine 自带 ElleKit，ElleKit 提供 MSHookFunction 等 Substrate 兼容符号）
+//    dyld 在【加载 dylib 的阶段】就要解析这些符号。TrollStore / TrollFools
+//    这类没有 Substrate / ElleKit 的环境解析失败，直接：
+//        dyld: Symbol not found: _MSHookFunction
+//        Referenced from: .../CheatKit.dylib
+//        Expected in: flat namespace
+//    进程立刻 abort —— 连 constructor 都跑不到，表现为「注入即闪退」。
 //
-//  如果你的环境完全没有 Substrate 兼容层（例如纯 TrollStore 无注入框架），
-//  CheatKit 会在第一次 hook 时因符号缺失而跳过，不会崩。
+//  ★ 现在怎么做：
+//    全部改用 src/Common/SubstrateRT.h 提供的运行时解析：
+//        CKHasSubstrate()          有没有 inline hook 能力
+//        CKInlineHook(...)         C 函数 hook，没有就返回 NO
+//        CKHookInstanceMethod(...) ObjC 方法，自动降级 method_setImplementation
+//
+//    这样二进制里零 Substrate 符号，加载阶段永远安全。
+//
+//  ★ 这个文件保留只为兼容历史 #import，新代码请直接用 SubstrateRT.h。
 //
 
 #ifndef CK_VENDOR_SUBSTRATE_H
 #define CK_VENDOR_SUBSTRATE_H
 
-#include <objc/runtime.h>
-#include <stddef.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// ---- 函数指针修补（Inline Hook）----
-// symbol : 目标函数地址
-// replace: 替换实现
-// result : 回传原实现（可为 NULL）
-void MSHookFunction(void *symbol, void *replace, void **result);
-
-// ---- Objective-C 方法替换 ----
-// 等价于 method_setImplementation，但会处理 super 调用链
-void MSHookMessageEx(Class _class, SEL sel, IMP imp, IMP *result);
-
-// ---- 符号与镜像查询 ----
-void *MSFindSymbol(void *image, const char *name);
-void *MSGetImageByName(const char *file);
-
-// ---- 部分新版本 ElleKit 提供的别名，声明一下方便可选使用 ----
-void *MSHookMemory(void *target, const void *data, size_t size);
-
-#ifdef __cplusplus
-}
-#endif
+#pragma message("vendor/substrate.h 已废弃，请改用 Common/SubstrateRT.h")
 
 #endif // CK_VENDOR_SUBSTRATE_H

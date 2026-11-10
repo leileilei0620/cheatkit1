@@ -8,7 +8,7 @@
 #import "FeatureFlags.h"          // 运行时开关（越狱绕过/反调试/dyld 隐藏各自独立）
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import "../vendor/substrate.h"
+#import "SubstrateRT.h"          // 运行时解析，不产生 MS* 符号依赖（裸注入不崩）
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <stdarg.h>
@@ -103,6 +103,8 @@ static void *g_real_dlsym(void *handle, const char *symbol) {
 
 // ============================================================
 //  安全 hook：符号不存在就跳过，绝不空指针 MSHookFunction
+//  ★ 用 CKInlineHook：内部走 dlsym 解析，没有 Substrate 时返回 NO
+//    而不是在二进制里留符号引用（那样 dylib 一加载就被 dyld abort）
 // ============================================================
 static void ck_hook_symbol(const char *name, void *replacement, void **origOut) {
     void *target = g_real_dlsym(RTLD_DEFAULT, name);
@@ -110,7 +112,11 @@ static void ck_hook_symbol(const char *name, void *replacement, void **origOut) 
         CKLog(@"[hook] 跳过（符号缺失）: %s", name);
         return;
     }
-    MSHookFunction(target, replacement, origOut);
+    if (!CKInlineHook(target, replacement, origOut)) {
+        if (origOut) *origOut = NULL;
+        CKLog(@"[hook] 跳过（无 Substrate，无法 inline hook）: %s", name);
+        return;
+    }
     CKLog(@"[hook] 已挂载: %s", name);
 }
 
@@ -269,8 +275,11 @@ int ck_sysctl(int *name, unsigned int namelen, void *oldp, size_t *oldlenp,
     int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
 
     // CTL_KERN, KERN_PROC, KERN_PROC_PID, pid
-    if (ck_dbgOn() && ret == 0 && oldp && namelen == 4 &&
-        name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
+    // ★ 必须校验缓冲区长度：oldlenp 是调用方给的缓冲区大小，
+    //   小于 0x24 时写 0x20 偏移会越界踩坏堆内存（表现为随机闪退）。
+    if (ck_dbgOn() && ret == 0 && oldp && oldlenp && namelen == 4 &&
+        name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID &&
+        *oldlenp >= 0x24) {
         // struct kinfo_proc 里的 kp_proc.p_flag，arm64 偏移 0x20
         uint32_t *pflag = (uint32_t *)((uint8_t *)oldp + 0x20);
         *pflag &= ~0x800;   // 清 P_TRACED
@@ -393,12 +402,28 @@ static ck_dyld_info_t *ck_get_all_image_infos(void) {
     dispatch_once(&once2, ^{
         uint32_t n = info->infoArrayCount;
 
-        // mprotect 放开只读页，才能改结构体
+        // ★ mprotect 必须检查返回值。
+        //   iOS 上 __DATA_CONST 页带 codesign 保护，mprotect 会失败（EACCES）。
+        //   失败后仍去写 info->infoArray 会直接 SIGBUS/SIGSEGV —— 这是
+        //   「注入后几秒随机闪退」的典型来源。
+        //   dyld_all_image_infos 在多数系统上本来就在可写 __DATA，先探测：
+
+        // 先看当前是否已经可写：试着读一次同类页的属性
         uintptr_t page = (uintptr_t)info & ~(uintptr_t)0xFFF;
-        mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE);
+        void *pg = (void *)page;
+        int rc = mprotect(pg, 0x1000, PROT_READ | PROT_WRITE);
+        if (rc != 0) {
+            CKLog(@"[dyld] mprotect 失败（errno=%d），跳过 infoArray 结构体层，"
+                  @"只保留 _dyld_image_count/_dyld_get_image_name 层", errno);
+            return;
+        }
 
         struct ck_dyld_image_info *dst =
             (struct ck_dyld_image_info *)malloc(sizeof(struct ck_dyld_image_info) * n);
+        if (!dst) {
+            CKLog(@"[dyld] malloc 失败，跳过结构体层");
+            return;
+        }
         uint32_t j = 0;
         for (uint32_t i = 0; i < n; i++) {
             const char *path = info->infoArray[i].imageFilePath;

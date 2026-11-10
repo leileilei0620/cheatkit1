@@ -123,7 +123,10 @@ def check_file(path):
     # 5. hook 之后再用裸 dlsym 取 orig 会自递归（必须走 g_real_dlsym 快照）
     #    唯一允许的例外：g_pdlsym 自身的引导调用（发生在 hook dlsym 之前）
     pat = r"=\s*\(?\w+\)?\s*(?<!g_real_)dlsym\s*\("
-    for m in re.finditer(pat, code):
+    #    SubstrateRT.m 是「用 dlsym 解析 MS* 符号」的模块，按设计要裸调 dlsym
+    if "SubstrateRT" in path:
+        pat = None
+    for m in (re.finditer(pat, code) if pat else []):
         ln = code[:m.start()].count(NL) + 1
         line_start = code.rfind(NL, 0, m.start()) + 1
         if "g_pdlsym" in code[line_start:m.start()]:

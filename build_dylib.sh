@@ -37,6 +37,7 @@ BUILD="build"
 SOURCES=(
     "src/CheatKit.m"
     "src/Common/Log.m"
+    "src/Common/SubstrateRT.m"
     "src/Common/Stats.m"
     "src/Common/Overlay.m"
     "src/Common/FeatureFlags.m"
@@ -180,6 +181,7 @@ compile_arch() {
             -framework CoreFoundation \
             -framework AdSupport \
             -framework QuartzCore \
+            -framework Security \
             -o "$BUILD/$NAME-$ARCH.dylib" \
             "${OBJS[@]}"; then
             LINK_OK=1
@@ -199,6 +201,7 @@ compile_arch() {
             -framework CoreFoundation \
             -framework AdSupport \
             -framework QuartzCore \
+            -framework Security \
             -undefined dynamic_lookup \
             -o "$BUILD/$NAME-$ARCH.dylib" \
             "${OBJS[@]}"; then
@@ -294,6 +297,48 @@ if command -v ldid >/dev/null 2>&1; then
         || ldid -S "$BUILD/$NAME.dylib"
 else
     echo "==> 没有 ldid，跳过签名（越狱 / TrollStore 环境仍可加载）"
+fi
+
+# ------------------------------------------------------------
+#  产物符号自检
+#    build_dylib.sh 用 -undefined dynamic_lookup 链接，源码里任何一个
+#    对 MSHookFunction / MSHookMessageEx 的直接调用，都会在 Mach-O 里
+#    留下未定义符号。dyld 在【加载阶段】就解析符号，找不到就直接
+#    _dyld_missing_symbol_abort → SIGABRT，连 constructor 都进不去。
+#    这里在出包前把它拦下来，避免又装到手机上才发现闪退。
+# ------------------------------------------------------------
+echo
+echo "==> 产物符号自检"
+
+NM=""
+for c in llvm-nm llvm-nm-18 llvm-nm-17 llvm-nm-16 llvm-nm-15 nm; do
+    if command -v "$c" >/dev/null 2>&1; then NM="$c"; break; fi
+done
+
+if [ -z "$NM" ]; then
+    echo "    没有 nm 可用，跳过符号自检"
+else
+    UNDEF="$("$NM" -u "$BUILD/$NAME.dylib" 2>/dev/null || true)"
+    if [ -z "$UNDEF" ]; then
+        echo "    读不到未定义符号表，跳过判定"
+    else
+        BAD=""
+        for sym in _MSHookFunction _MSHookMessageEx _MSFindSymbol \
+                   _MSGetImageByName _MSHookMemory _SubstrateHookFunction \
+                   _LHHookFunctions; do
+            if printf '%s\n' "$UNDEF" | grep -qE "(^|[^A-Za-z0-9_])${sym}$"; then
+                BAD="$BAD $sym"
+            fi
+        done
+        if [ -n "$BAD" ]; then
+            echo "    !! 发现不该存在的未定义符号:$BAD"
+            echo "    !! 注入后会 dyld: Symbol not found → SIGABRT 闪退"
+            echo "    !! 源码里仍在直接调用 Substrate API，请改用 Common/SubstrateRT.h"
+            exit 1
+        fi
+        TOTAL="$(printf '%s\n' "$UNDEF" | grep -c . || true)"
+        echo "    未定义符号 $TOTAL 个，无 Substrate 残留 OK"
+    fi
 fi
 
 # ------------------------------------------------------------

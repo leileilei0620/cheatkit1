@@ -24,6 +24,7 @@
 #import "Common/Stats.h"
 #import "Common/Overlay.h"
 #import "Common/FeatureFlags.h"
+#import "Common/SubstrateRT.h"     // 运行时 hook 能力探测
 #import "Common/Fingerprint.h"
 #import "Common/AntiDetect.h"
 #import "Modules/AdEngine.h"
@@ -43,6 +44,9 @@ static void ck_bootstrap_target_app(void) {
 
     // 先把运行时开关/参数读一遍，下面各模块安装时就按用户设置走
     CKDumpFeatures();
+
+    // ★ 探测 hook 能力：有没有 Substrate/ElleKit 决定后面哪些 hook 能装
+    CKDumpSubstrateStatus();
 
     // ★ 浮窗提到最前面装：
     //   1. 注入成功 = 立刻能看到面板，不用等后面几秒的类扫描

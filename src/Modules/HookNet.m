@@ -9,7 +9,7 @@
 #import "../Common/Rewriter.h"
 #import "../Common/FeatureFlags.h"   // 运行时开关
 #import "../Config.h"
-#import "../vendor/substrate.h"
+#import "../Common/SubstrateRT.h"    // 运行时解析（裸注入不崩）
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -151,12 +151,21 @@ static void ck_dataCompletion(id self, SEL _cmd, NSData *data,
 void CKInstallNetHooks(void) {
 #if ENABLE_NET_TAMPER
     // A1 —— SecTrust 层（最底层，覆盖 NSURLSession / CFNetwork / AFNetworking）
+    // ★ 用 CKInlineHook：没 Substrate 时返回 NO 并留 NULL，
+    //   下面各层 hook 仍会照常装，只是 SecTrust 这一层不生效
     void *h1 = dlsym(RTLD_DEFAULT, "SecTrustEvaluate");
-    if (h1) MSHookFunction(h1, (void *)ck_SecTrustEvaluate, (void **)&orig_SecTrustEvaluate);
+    if (h1 && !CKInlineHook(h1, (void *)ck_SecTrustEvaluate,
+                            (void **)&orig_SecTrustEvaluate)) {
+        orig_SecTrustEvaluate = NULL;
+        CKLog(@"[net] SecTrustEvaluate 跳过（无 Substrate）");
+    }
 
     void *h2 = dlsym(RTLD_DEFAULT, "SecTrustEvaluateWithError");
-    if (h2) MSHookFunction(h2, (void *)ck_SecTrustEvaluateWithError,
-                           (void **)&orig_SecTrustEvaluateWithError);
+    if (h2 && !CKInlineHook(h2, (void *)ck_SecTrustEvaluateWithError,
+                            (void **)&orig_SecTrustEvaluateWithError)) {
+        orig_SecTrustEvaluateWithError = NULL;
+        CKLog(@"[net] SecTrustEvaluateWithError 跳过（无 Substrate）");
+    }
 
     // A2 / A3
     ck_install_session_delegate_hook();
