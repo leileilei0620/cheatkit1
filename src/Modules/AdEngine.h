@@ -38,4 +38,10 @@ void CKTryScheduleReward(id adObj, double delaySec);
 // 直接投递一次，不管去重（去重标记由调用方负责）
 BOOL CKInvokeDelegateReward(id adObj);
 
+// 从广告对象解析出真正能收奖励回调的 delegate（找不到返回 nil）
+id CKDelegateFromAdObject(id adObj);
+
+// 登记「最近能收奖励的那个对象」，供播放器层补发时回落
+void CKRegisterRewardDelegate(id delegate);
+
 #endif

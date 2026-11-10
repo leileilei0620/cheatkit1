@@ -276,11 +276,18 @@ static BOOL ck_parseShape(const char *enc, CKShape *out) {
 // ============================================================
 //  全局 slot 表 —— 双键 (Class, SEL)
 // ============================================================
+// 槽表里除了原实现，还要记住「这个方法的语义类别」。
+// ★ 为什么必须记：trampoline 是按「参数形状」复用的，同一份 ck_h2_ii
+//   既可能服务奖励回调、也可能服务播放回调。只有 slot 里存了类别，
+//   trampoline 才知道该不该主动补发一次奖励。
+typedef enum { CKSlotOther = 0, CKSlotReward = 1, CKSlotPlay = 2, CKSlotFail = 3 } CKSlotKind;
+
 typedef struct {
-    Class    cls;
-    SEL      sel;
-    IMP      orig;
-    BOOL     used;
+    Class      cls;
+    SEL        sel;
+    IMP        orig;
+    CKSlotKind kind;
+    BOOL       used;
 } CKSlot;
 
 #define CK_MAX_SLOTS 2048
@@ -289,15 +296,16 @@ static int    g_slotCount = 0;
 static pthread_mutex_t g_slotLock = PTHREAD_MUTEX_INITIALIZER;
 
 // 从 self 的类开始沿父类链找 (cls, sel)，覆盖继承场景
-static IMP ck_origFor(id self, SEL sel) {
+// 返回 slot 指针（而不是只返回 IMP），这样 trampoline 能同时拿到语义类别
+static CKSlot *ck_slotFor(id self, SEL sel) {
     Class c = object_getClass(self);
     pthread_mutex_lock(&g_slotLock);
     for (; c != Nil; c = class_getSuperclass(c)) {
         for (int i = 0; i < g_slotCount; i++) {
             if (g_slots[i].used && g_slots[i].sel == sel && g_slots[i].cls == c) {
-                IMP imp = g_slots[i].orig;
+                CKSlot *slot = &g_slots[i];
                 pthread_mutex_unlock(&g_slotLock);
-                return imp;
+                return slot;
             }
         }
     }
@@ -314,53 +322,109 @@ static IMP ck_origFor(id self, SEL sel) {
 // ============================================================
 static inline BOOL ck_rewardOn(void) { return CKFeatureGet(CKFeatureRewardForce); }
 
+// ★ 统一的后置动作：按 slot 的语义类别决定要不要主动补发一次奖励。
+//
+//   为什么必须有这一步（这是「看完没奖励」的根因）：
+//     原实现的 trampoline 只做一件事 —— 把 BOOL 参数从 NO 改成 YES，
+//     然后就转调原实现。这对「服务器已经判定发奖了，只是本地被 NO 卡住」
+//     的场景有效；但真实情况是：
+//       · 用户根本没看满 15 秒 → 服务器压根没下发发奖指令
+//       · onRewardVerify 这种回调根本不会被调用 → hook 永远不会触发
+//     所以必须由我们自己「制造」一次奖励回调：抓住播放开始/倒计时结束
+//     这些真实会发生的入口，延时向 delegate 投递一次奖励回调。
+//
+//   语义分工（和 HookReward 的 CKKindPlay 一致）：
+//     CKSlotPlay   —— 播放/倒计时入口：真正的掐表点，延时补发
+//     CKSlotReward —— 奖励回调本身：只登记 delegate，绝不二次补发
+//                     （否则一支广告发两次奖，游戏侧 dismiss 撞车 → 闪退）
+static void ck_postAction(id self, SEL sel, id arg) {
+    if (!ck_rewardOn()) return;
+    CKSlot *slot = ck_slotFor(self, sel);
+    if (!slot) return;
+
+    // 无论哪个类别，先把 self 上能找到的 delegate 登记掉。
+    //   self 是广告对象时能直接拿到奖励 delegate；
+    //   self 是播放器/倒计时对象时拿不到（播放器 delegate 是播放器协议），
+    //   这时靠之前登记过的全局回落。
+    id d = CKDelegateFromAdObject(self);
+    if (d) CKRegisterRewardDelegate(d);
+
+    if (slot->kind == CKSlotPlay) {
+        // 播放入口 = 真正的掐表点，主动补发一次。
+        //   ★ 用 self 而不是 arg 当目标：self 一定活着且生命周期跟着这次播放；
+        //     arg 可能是 nil、error 对象、进度数字包装，挂去重标记会挂错地方。
+        //     真正的 delegate 由 CKInvokeDelegateReward 三级回落去找。
+        CKLog(@"[引擎] 播放入口 -%s，排程补发", sel_getName(sel));
+        CKTryScheduleReward(self, 1.0);
+    }
+    // CKSlotReward：到这里已经登记完 delegate 就够了，绝不二次补发
+}
+
 static void ck_h0(id self, SEL _cmd) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
+    ck_postAction(self, _cmd, nil);
     if (o) ((void (*)(id, SEL))o)(self, _cmd);
 }
 static void ck_h1(id self, SEL _cmd, id a) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
+    ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a);
 }
 static void ck_h2_ib(id self, SEL _cmd, id a, BOOL b) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
     if (ck_rewardOn() && !b) {
         CKLog(@"[引擎] -%s 参数2 NO -> YES", sel_getName(_cmd));
         b = YES;
     }
+    ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id, BOOL))o)(self, _cmd, a, b);
 }
 static void ck_h2_ii(id self, SEL _cmd, id a, id b) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
+    ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b);
 }
 static void ck_h2_in(id self, SEL _cmd, id a, NSInteger b) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
     if (ck_rewardOn() && b == 0) b = 1;
+    ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id, NSInteger))o)(self, _cmd, a, b);
 }
 static void ck_h3_iii(id self, SEL _cmd, id a, id b, id c) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
+    ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c);
 }
 static void ck_h3_ibi(id self, SEL _cmd, id a, BOOL b, id c) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
     if (ck_rewardOn() && !b) {
         CKLog(@"[引擎] -%s 参数2 NO -> YES", sel_getName(_cmd));
         b = YES;
     }
+    ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id, BOOL, id))o)(self, _cmd, a, b, c);
 }
 static void ck_h3_iib(id self, SEL _cmd, id a, id b, BOOL c) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
     if (ck_rewardOn() && !c) {
         CKLog(@"[引擎] -%s 参数3 NO -> YES", sel_getName(_cmd));
         c = YES;
     }
+    ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id, id, BOOL))o)(self, _cmd, a, b, c);
 }
 static void ck_h4_iiii(id self, SEL _cmd, id a, id b, id c, id d) {
-    IMP o = ck_origFor(self, _cmd);
+    CKSlot *slot = ck_slotFor(self, _cmd);
+    IMP o = slot ? slot->orig : NULL;
+    ck_postAction(self, _cmd, a);
     if (o) ((void (*)(id, SEL, id, id, id, id))o)(self, _cmd, a, b, c, d);
 }
 
@@ -454,22 +518,150 @@ static NSArray<NSString *> *ck_rewardSelCandidates(void) {
     return a;
 }
 
+// delegate 候选键：覆盖 17 家 SDK 的实际命名（含下划线私有写法）
+static NSArray<NSString *> *ck_delegateKeys(void) {
+    static NSArray *a;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        a = @[
+            @"delegate", @"_delegate",
+            @"rewardedVideoAdDelegate", @"rewardedAdDelegate",
+            @"adDelegate", @"adViewDelegate", @"rewardDelegate",
+            @"rewardVideoDelegate", @"rewardedDelegate",
+            @"listener", @"adListener", @"rewardListener",
+            @"callbacks", @"callback", @"handler",
+            @"interstitialDelegate", @"videoDelegate",
+        ];
+    });
+    return a;
+}
+
+// ★ 全局登记：最近一次被识别出来的「真正能收奖励回调的对象」。
+//   为什么需要：HookReward 的 CKKindPlay 规则挂在播放器/倒计时上
+//   （BUPlayer、TKSVideoPlayer、GDTAutoCountTimer…），这些对象的 delegate
+//   是播放器协议，不是奖励协议 —— 直接拿它们去补发永远找不到方法，
+//   表现就是「有的软件看完没有奖励」。
+//   所以：奖励类回调命中时把 delegate 记下来，播放器层补发时回落到它。
+//   ★ 必须用 __weak 而不是强引用：
+//   广告 delegate 常常是某个 ViewController 或它的子对象。
+//   这里如果强持有，用户关掉广告页后那个 VC 就永远释放不掉，
+//   反复开广告会一路泄漏，最后 OOM 或 UI 卡死。
+//   weak 在对象释放后自动变 nil，ck_lastRewardDelegate 返回 nil 时
+//   调用方会走「找不到 delegate，本次跳过」的安全分支。
+static __weak id g_lastRewardDelegate = nil;
+static pthread_mutex_t g_delegateLock = PTHREAD_MUTEX_INITIALIZER;
+
+void CKRegisterRewardDelegate(id delegate) {
+    if (!delegate) return;
+    pthread_mutex_lock(&g_delegateLock);
+    g_lastRewardDelegate = delegate;            // __weak：不持有，释放后自动 nil
+    pthread_mutex_unlock(&g_delegateLock);
+}
+
+static id ck_lastRewardDelegate(void) {
+    pthread_mutex_lock(&g_delegateLock);
+    id d = g_lastRewardDelegate;
+    pthread_mutex_unlock(&g_delegateLock);
+    return d;
+}
+
 static id ck_delegateOf(id adObj) {
     if (!adObj) return nil;
-    for (NSString *k in @[@"delegate", @"rewardedVideoAdDelegate",
-                          @"adDelegate", @"rewardDelegate", @"listener"]) {
+
+    // 1) KVC 直取（最常用）
+    for (NSString *k in ck_delegateKeys()) {
         @try {
             id d = [adObj valueForKey:k];
-            if (d && d != adObj) return d;
+            // delegate 必须实现至少一个奖励类回调才算数，否则是别的用途的 field
+            if (d && d != adObj && [d respondsToSelector:@selector(respondsToSelector:)]) {
+                for (NSString *name in ck_rewardSelCandidates()) {
+                    if ([d respondsToSelector:NSSelectorFromString(name)]) return d;
+                }
+            }
         } @catch (__unused NSException *e) {}
+    }
+
+    // 2) 兜底：遍历实例变量找「实现了奖励回调的对象」
+    //    有些 SDK 把 delegate 存在 ivar 里且不响应 KVC（比如 C++ 桥接层）
+    //
+    //    ★ 安全约束：只碰「ivar 名含 delegate/listener/callback/handler/
+    //      target/observer」的字段。
+    //      原因：object_getIvar 对 assign / unsafe_unretained 的 @ 类型
+    //      ivar 会原样返回裸指针 —— 那个对象可能早就释放了，
+    //      后面一句 respondsToSelector 就是野指针调用 → 直接 SIGSEGV。
+    //      名字过滤把风险压到最低：这些字段按 SDK 惯例都是 strong/weak，
+    //      runtime 会帮我们维护正确性。
+    static const char *kIvarHints[] = {
+        "delegate", "listener", "callback", "handler", "target", "observer"
+    };
+    unsigned int n = 0;
+    Ivar *ivars = class_copyIvarList(object_getClass(adObj), &n);
+    if (ivars) {
+        for (unsigned int i = 0; i < n; i++) {
+            const char *t = ivar_getTypeEncoding(ivars[i]);
+            if (!t || t[0] != '@') continue;
+
+            const char *iname = ivar_getName(ivars[i]);
+            if (!iname) continue;
+            BOOL nameHit = NO;
+            for (size_t k = 0; k < sizeof(kIvarHints)/sizeof(kIvarHints[0]); k++) {
+                if (ck_strcasestr(iname, kIvarHints[k])) { nameHit = YES; break; }
+            }
+            if (!nameHit) continue;
+
+            @try {
+                id v = object_getIvar(adObj, ivars[i]);
+                if (!v || v == adObj) continue;
+                for (NSString *name in ck_rewardSelCandidates()) {
+                    if ([v respondsToSelector:NSSelectorFromString(name)]) {
+                        free(ivars);
+                        return v;
+                    }
+                }
+            } @catch (__unused NSException *e) {}
+        }
+        free(ivars);
+    }
+
+    // 3) 最后兜底：adObj 自己就是 delegate（有的 SDK 让广告对象直接实现协议）
+    for (NSString *name in ck_rewardSelCandidates()) {
+        if ([adObj respondsToSelector:NSSelectorFromString(name)]) return adObj;
     }
     return nil;
 }
 
+// 把 adObj 的 delegate 解析出来并登记（供播放器层回落使用）
+static id ck_delegateOfAndRemember(id adObj) {
+    id d = ck_delegateOf(adObj);
+    if (d) CKRegisterRewardDelegate(d);
+    return d;
+}
+
+// 对外：给 HookReward 的奖励类回调用来「只登记不补发」
+id CKDelegateFromAdObject(id adObj) { return ck_delegateOf(adObj); }
+
 BOOL CKInvokeDelegateReward(id adObj) {
     if (!ck_rewardOn()) return NO;          // 开关关掉 → 不补发
+
+    // ★ 三级回落：
+    //   ① adObj 自己的 delegate（正常情况）
+    //   ② 全局登记的「最近奖励 delegate」—— 播放器/倒计时触发的补发靠这条，
+    //      因为播放器对象的 delegate 是播放器协议，不含奖励方法
+    //   ③ adObj 自己就是 delegate
+    //   原实现只有 ①，所以从播放器层（CKKindPlay）补发几乎全部失效。
     id d = ck_delegateOf(adObj);
-    if (!d) return NO;
+    if (!d) d = ck_lastRewardDelegate();
+    if (!d) {
+        for (NSString *name in ck_rewardSelCandidates()) {
+            if ([adObj respondsToSelector:NSSelectorFromString(name)]) { d = adObj; break; }
+        }
+    }
+    if (!d) {
+        CKLog(@"[补发] 找不到 delegate（adObj=%s），本次跳过",
+              adObj ? class_getName(object_getClass(adObj)) : "nil");
+        return NO;
+    }
+    CKRegisterRewardDelegate(d);            // 记住，下次播放器层触发可直接用
 
     for (NSString *name in ck_rewardSelCandidates()) {
         SEL sel = NSSelectorFromString(name);
@@ -478,7 +670,7 @@ BOOL CKInvokeDelegateReward(id adObj) {
         NSMethodSignature *sig = [d methodSignatureForSelector:sel];
         if (!sig) continue;
         NSUInteger nargs = [sig numberOfArguments] - 2;
-        if (nargs > 3) continue;
+        if (nargs > 4) continue;
 
         @try {
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
@@ -489,10 +681,29 @@ BOOL CKInvokeDelegateReward(id adObj) {
                 const char *t = [sig getArgumentTypeAtIndex:idx + 2];
                 if (!t) continue;
                 if (t[0] == '@') {
-                    id arg = (idx == 0) ? adObj
-                             : @{@"reward_name": @"default",
-                                 @"reward_amount": @(1),
-                                 @"ecpm": @(CKFakeEcpm())};
+                    // ★ 第 0 个 @ 参数给 adObj（绝大多数 SDK 是 (ad, ...)），
+                    //   后面的给 info 字典。字典里把常见键名全填上，
+                    //   因为不同 SDK 取 @[@"amount"] / @[@"reward_amount"] /
+                    //   @[@"rewardCount"] 各不相同，键缺失会当成 0 奖励。
+                    id arg;
+                    if (idx == 0) {
+                        arg = adObj;
+                    } else {
+                        arg = @{
+                            @"reward_name":   @"default",
+                            @"name":          @"default",
+                            @"reward_amount": @(1),
+                            @"amount":        @(1),
+                            @"rewardCount":   @(1),
+                            @"count":         @(1),
+                            @"quantity":      @(1),
+                            @"ecpm":          @(CKFakeEcpm()),
+                            @"revenue":       @(CKFakeEcpm()),
+                            @"isValid":       @(YES),
+                            @"valid":         @(YES),
+                            @"verified":      @(YES),
+                        };
+                    }
                     [inv setArgument:&arg atIndex:(NSInteger)(idx + 2)];
                 } else if (t[0] == 'c' || t[0] == 'B') {
                     BOOL yes = YES;
@@ -516,25 +727,66 @@ BOOL CKInvokeDelegateReward(id adObj) {
 static void ck_scheduleReward(id adObj, double delaySec) {
     if (!adObj) return;
     if (!ck_rewardOn()) return;             // 开关关掉 → 不排程
-    static const void *kKey = &kKey;
-    if (objc_getAssociatedObject(adObj, kKey)) return;
-    objc_setAssociatedObject(adObj, kKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // 冷却：同一时刻太密集的补发容易被服务端判异常，用参数表里的值
-    static NSTimeInterval lastFire = 0;
+    // ★ 去重按「这一次播放」算，不是按对象算。
+    //   原实现用 associated object 永久占位：同一个 ad 对象被复用第二次
+    //   （SDK 常见做法：广告位只 new 一次，反复 show）就再也补发不出来，
+    //   表现就是「有的软件看完没有奖励」。
+    //   现在改成存「上次触发时间」，超过冷却时间就允许再来一次。
+    static const void *kKey = &kKey;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSNumber *last = objc_getAssociatedObject(adObj, kKey);
     NSTimeInterval cool = CKParamGet(CKP_REWARD_COOL);
-    if (cool > 0 && (now - lastFire) < cool) {
-        CKLog(@"[补发] 冷却中（剩余 %.0fs），跳过", cool - (now - lastFire));
-        objc_setAssociatedObject(adObj, kKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // ★ 冷却改成「每个 ad 对象各自计时」，不再是全进程一个静态变量。
+    //   原来一个 App 里发过奖，45 秒内切到另一个 App 的广告都会被吞掉。
+    if (last && cool > 0 && (now - last.doubleValue) < cool) {
+        CKLog(@"[补发] 本广告对象冷却中（剩余 %.0fs），跳过", cool - (now - last.doubleValue));
         return;
     }
-    lastFire = now;
+    objc_setAssociatedObject(adObj, kKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     CKLog(@"[补发] 已排程，%.1f 秒后投递", delaySec);
+
+    // ★ 投递必须在主线程。
+    //   原实现用的是 dispatch_get_global_queue —— 这是「领奖闪退」的头号原因：
+    //     1. 广告 SDK 的 delegate 回调按合同都必须在主线程调用，
+    //        游戏侧收到回调后会去刷 UI / 改 UIKit 状态，
+    //        在后台线程碰 UIKit 直接触发 main thread checker 或野内存访问；
+    //     2. 有的 SDK 在回调里 dismiss 全屏广告控制器，
+    //        dismiss 一个非主线程持有的 VC → 崩溃；
+    //     3. NSInvocation 里的参数是 block / weak 引用时，
+    //        后台线程拿到的对象可能已被释放。
+    //   统一回主线程后，行为和 SDK 自己正常发奖时完全一致。
+    // ★ 找不到 delegate 时重试两次。
+    //   场景：播放入口比「广告对象创建 delegate」更早触发，
+    //   第一次投递必然失败。给 SDK 2~4 秒把对象建起来再试，
+    //   否则这一支广告的奖励就彻底丢了（表现为「看完没奖励」）。
+    static const double kRetryDelay[2] = {2.0, 4.0};
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(0, 0), ^{
-        CKInvokeDelegateReward(adObj);
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            if (CKInvokeDelegateReward(adObj)) return;
+
+            CKLog(@"[补发] 第 1 次未找到 delegate，%.0fs 后重试", kRetryDelay[0]);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(kRetryDelay[0] * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @autoreleasepool {
+                    if (CKInvokeDelegateReward(adObj)) return;
+                    CKLog(@"[补发] 第 2 次仍未找到，%.0fs 后最后一次", kRetryDelay[1]);
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(kRetryDelay[1] * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        @autoreleasepool {
+                            if (!CKInvokeDelegateReward(adObj)) {
+                                CKLog(@"[补发] 三次均失败，放弃这一支（delegate 未就绪）");
+                            }
+                        }
+                    });
+                }
+            });
+        }
     });
 }
 
@@ -589,6 +841,16 @@ static void ck_hookClass(Class cls, const char *clsName, CKStat *st) {
         slot->cls = cls;
         slot->sel = sel;
         slot->orig = orig;
+        // ★ 类别优先级：奖励 > 播放 > 失败。
+        //   同一 SEL 可能同时命中多个关键词（如 rewardedVideoAdDidPlayFinish
+        //   既含 reward 又含 playfinish），但它的真实语义是「播放结束」，
+        //   所以要按 fail > play > reward 的顺序选？—— 不行。
+        //   实测：xxxDidPlayFinish: 这类在 SDK 里是「播放结束」回调，
+        //   是补发的正确触发点；而 xxxDidReward: 是「已发奖」通知。
+        //   两者关键词都会命中 reward（因为带 reward 字样）。
+        //   因此这里用「先判 play 再判 reward」：播放类更早、更可靠。
+        slot->kind = play ? CKSlotPlay : (reward ? CKSlotReward
+                                              : (fail ? CKSlotFail : CKSlotOther));
         slot->used = YES;
         pthread_mutex_unlock(&g_slotLock);
 

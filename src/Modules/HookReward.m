@@ -207,8 +207,15 @@ static void ck_ex_2(id self, SEL _cmd, id a, id b) {
     CKExactSlot *s = ck_findExact(self, _cmd);
     if (!s) return;
     if (s->kind == CKKindReward && ck_rewardForceOn()) {
-        CKLog(@"[精确] 奖励回调 -%s，参数=%@ / %@", sel_getName(_cmd), a, b);
-        CKTryScheduleReward(a, 0.6);
+        // ★ 这里刻意「只登记、不补发」。
+        //   原实现在奖励回调里又调 CKTryScheduleReward 投递一次，
+        //   而紧接着的 orig(...) 会让 SDK 自己再发一次 —— 同一支广告发两次奖。
+        //   游戏侧收到第二次回调时，奖励弹窗/全屏广告正在 dismiss，
+        //   就会出现「领奖闪退」（典型是 present/dismiss 撞车或 UI 被释放后再刷）。
+        //   这里只把 delegate 记下来，供播放器层补发时回落使用。
+        CKLog(@"[精确] 奖励回调 -%s（原生已发奖，不再补投）", sel_getName(_cmd));
+        id d = CKDelegateFromAdObject(self);
+        if (d) CKRegisterRewardDelegate(d);
     }
     ((void (*)(id, SEL, id, id))s->orig)(self, _cmd, a, b);
 }
@@ -218,7 +225,11 @@ static void ck_ex_2b(id self, SEL _cmd, id a, BOOL b) {
     if (!s) return;
     if (ck_rewardForceOn()) {
         if (!b) { CKLog(@"[精确] -%s verify NO -> YES", sel_getName(_cmd)); b = YES; }
-        if (s->kind == CKKindReward) CKTryScheduleReward(a, 0.6);
+        if (s->kind == CKKindReward) {
+            // ★ 同上：只登记 delegate，不二次补发（否则一支广告发两次奖）
+            id d = CKDelegateFromAdObject(self);
+            if (d) CKRegisterRewardDelegate(d);
+        }
     }
     ((void (*)(id, SEL, id, BOOL))s->orig)(self, _cmd, a, b);
 }
