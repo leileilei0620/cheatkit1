@@ -1,5 +1,18 @@
 name: Build Dylib
 
+# 触发方式：
+#   1. 推代码 / 提 PR 自动编译
+#   2. 手动点 Actions → Build Dylib → Run workflow（最常用）
+#   3. 打 tag（v1.0 之类）自动编译并发布 Release
+#
+# 产物：CheatKit.dylib（裸 dylib，不是 deb）
+#   - install_name = @executable_path/Frameworks/CheatKit.dylib
+#   - 可直接被 TrollFools / 注入工具加载
+#
+# ★ 用 Ubuntu 而不是 macOS：
+#   - Theos 官方支持 Linux 编译，不需要 Xcode
+#   - runner 启动快（十几秒 vs 几分钟），额度便宜 10 倍
+#   - 避开 macos-14 在你账号下被解析成 arm64 池而报错的问题
 on:
   push:
     branches: [ main, master ]
